@@ -1,228 +1,644 @@
 import os
+import re
+import json
+import bcrypt
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import (
-    JWTManager, create_access_token,
-    jwt_required, get_jwt_identity
+    JWTManager, create_access_token, jwt_required, get_jwt_identity,
+    jwt_optional
 )
-import bcrypt
-from dotenv import load_dotenv
-
-# 加载 .env（可选）
-load_dotenv()
-
-# --- 1. 配置 ---
+from sqlalchemy import event, text
+from sqlalchemy.engine import Engine
+# --- Flask + SQLite + FTS5 配置 ---
 app = Flask(__name__)
-app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
-    "DATABASE_URL",
-    "sqlite:///notesapp.db"
-)
+app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///notesapp.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "jwt-please-change")
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY","super-secret-key")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(days=7)
-
-# --- 2. 初始化 ---
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
-
-# --- 3. 定义模型 ---
+### PRAGMA 开启外键
+@event.listens_for(Engine, "connect")
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+# --- 数据表 ---
 class User(db.Model):
-    __tablename__ = "users"
-    id           = db.Column(db.Integer, primary_key=True)
-    username     = db.Column(db.String(50), unique=True, nullable=False)
-    email        = db.Column(db.String(120), unique=True, nullable=False)
-    password_hash= db.Column(db.LargeBinary(60), nullable=False)
-    created_at   = db.Column(db.DateTime, default=datetime.utcnow)
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(50), unique=True, nullable=False, index=True)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.LargeBinary(60), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-    def set_password(self, pw):
+    def set_password(self, pw:str):
         self.password_hash = bcrypt.hashpw(pw.encode(), bcrypt.gensalt())
 
-    def check_password(self, pw):
+    def check_password(self, pw:str) -> bool:
         return bcrypt.checkpw(pw.encode(), self.password_hash)
-
 class Note(db.Model):
     __tablename__ = "notes"
-    id         = db.Column(db.Integer, primary_key=True)
-    author_id  = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
-    title      = db.Column(db.String(255), nullable=False)
-    content    = db.Column(db.Text, nullable=False)
-    is_public  = db.Column(db.Boolean, default=False)
+    id = db.Column(db.Integer, primary_key=True)
+    author_id = db.Column(db.Integer, db.ForeignKey("user.id", ondelete="CASCADE"), nullable=False, index=True)
+    title = db.Column(db.String(255), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    is_public = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime,
-                           default=datetime.utcnow,
-                           onupdate=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     author = db.relationship("User", backref=db.backref("notes", lazy=True))
-
-# FTS5 虚拟表，用于全文搜索 title 和 content
-# 建表时会手工执行 CREATE VIRTUAL TABLE ... AFTER db.create_all()
-FTS_TABLE = "notes_fts"
-
-# --- 4. 建表 & 初始化 FTS ---
-@app.before_first_request
-def init_db():
-    db.create_all()
-    # 如果 FTS 表不存在，则创建
-    sql = f"SELECT name FROM sqlite_master WHERE type='table' AND name='{FTS_TABLE}'"
-    res = db.session.execute(sql).fetchone()
-    if not res:
-        db.session.execute(f"""
-            CREATE VIRTUAL TABLE {FTS_TABLE}
-            USING fts5(title, content, note_id UNINDEXED);
+# FTS5 虚拟表，用于全文搜索笔记
+# SQLite 不支持用 ORM 自动创建，手动创建
+# 搜索 match 语法示例:
+# SELECT notes.*
+# FROM notes JOIN notes_fts ON notes.id = notes_fts.rowid
+# WHERE notes_fts MATCH 'searchterm'
+# 监听 SQLAlchemy create_all: 手动创建 FTS 表和 triggers
+def setup_fts5():
+    with app.app_context():
+        conn = db.engine.raw_connection()
+        c = conn.cursor()
+        # 创建虚拟表
+        c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(title, content, content='notes', content_rowid='id');")
+        # 创建触发器同步 notes -> notes_fts
+        c.execute("""
+            CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
+                INSERT INTO notes_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
+            END;
         """)
-        # 初次同步现有数据
-        notes = Note.query.all()
-        for n in notes:
-            db.session.execute(f"""
-                INSERT INTO {FTS_TABLE}(rowid, title, content, note_id)
-                VALUES (:rid, :t, :c, :nid)
-            """, {"rid": n.id, "t": n.title, "c": n.content, "nid": n.id})
-        db.session.commit()
-
-# 工具：同步单条 Note 到 FTS
-def sync_fts(note: Note):
-    # 删除旧记录
-    db.session.execute(f"DELETE FROM {FTS_TABLE} WHERE note_id=:nid",
-                       {"nid": note.id})
-    # 插入新记录
-    db.session.execute(f"""
-        INSERT INTO {FTS_TABLE}(rowid, title, content, note_id)
-        VALUES (:rid, :t, :c, :nid)
-    """, {"rid": note.id, "t": note.title, "c": note.content, "nid": note.id})
-    db.session.commit()
-
-# --- 5. 路由：注册、登录 ---
+        c.execute("""
+            CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes BEGIN
+                INSERT INTO notes_fts(notes_fts, rowid, title, content) VALUES('delete', old.id, old.title, old.content);
+            END;
+        """)
+        c.execute("""
+            CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes BEGIN
+                INSERT INTO notes_fts(notes_fts, rowid, title, content) VALUES('delete', old.id, old.title, old.content);
+                INSERT INTO notes_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
+            END;
+        """)
+        conn.commit()
+        c.close()
+        conn.close()
+# --- 工具函数: LCS 算法 (用户搜索排名) ---
+def longest_common_subsequence(a: str, b: str) -> int:
+    a = a.lower()
+    b = b.lower()
+    m, n = len(a), len(b)
+    dp = [ [0]*(n+1) for _ in range(m+1)]
+    for i in range(m):
+        for j in range(n):
+            if a[i] == b[j]:
+                dp[i+1][j+1] = dp[i][j] +1
+            else:
+                dp[i+1][j+1] = max(dp[i][j+1], dp[i+1][j])
+    return dp[m][n]
+# --- 注册 ---
 @app.route("/auth/register", methods=["POST"])
 def register():
-    data = request.get_json()
+    data = request.json
+    if not data or not all(k in data for k in ("username","email","password")):
+        return jsonify({"msg":"缺少注册信息"}), 400
     if User.query.filter_by(username=data["username"]).first():
-        return jsonify({"msg": "用户名已存在"}), 400
+        return jsonify({"msg":"用户名已被注册"}), 400
     if User.query.filter_by(email=data["email"]).first():
-        return jsonify({"msg": "邮箱已注册"}), 400
-
+        return jsonify({"msg":"邮箱已被注册"}), 400
     u = User(username=data["username"], email=data["email"])
     u.set_password(data["password"])
     db.session.add(u)
     db.session.commit()
-    return jsonify({"msg": "注册成功"}), 201
-
+    return jsonify({"msg":"注册成功"}), 201
+# --- 登录 ---
 @app.route("/auth/login", methods=["POST"])
 def login():
-    data = request.get_json()
-    u = User.query.filter(
-        (User.username == data["username"]) | (User.email == data["username"])
-    ).first()
-    if not u or not u.check_password(data["password"]):
-        return jsonify({"msg": "用户名或密码错误"}), 401
+    data = request.json
+    if not data or not data.get("username") or not data.get("password"):
+        return jsonify({"msg":"请输入用户名和密码"}), 400
+    # 支持用户名或邮箱登录
+    user = User.query.filter((User.username==data['username']) | (User.email==data['username'])).first()
+    if not user or not user.check_password(data["password"]):
+        return jsonify({"msg":"用户名或密码错误"}), 401
+    access_token = create_access_token(identity=user.id)
+    return jsonify({"access_token": access_token, "username": user.username})
+# --- 用户搜索接口 使用 LCS 排序 ---
+@app.route("/users/search")
+@jwt_required()
+def user_search():
+    q = request.args.get("q","").strip()
+    if not q:
+        return jsonify([])
+    # 先模糊匹配，搜索 用户名 包含 q (不区分大小写)
+    users = User.query.filter(User.username.ilike(f"%{q}%")).all()
+    # LCS 排序，倒序
+    users.sort(key=lambda u: longest_common_subsequence(u.username, q), reverse=True)
+    # 返回前20条
+    result = [{"id":u.id,"username":u.username} for u in users[:20]]
+    return jsonify(result)
+# --- 用户主页获取某个用户笔记, 支持搜索 ---
+@app.route("/users/<int:user_id>/notes")
+@jwt_optional
+def user_notes(user_id):
+    q = request.args.get("q", "").strip()
+    current_user_id = get_jwt_identity()
+    target_user = User.query.get_or_404(user_id)
 
-    token = create_access_token(identity=u.id)
-    return jsonify({"access_token": token}), 200
+    # 选择查询条件
+    base_query = Note.query.filter_by(author_id=user_id)
 
-# --- 6. 笔记 CRUD ---
+    # 访问者非笔记主人，只能看公开笔记
+    if current_user_id != user_id:
+        base_query = base_query.filter_by(is_public=True)
+
+    # FTS5全文搜索 如果 q，优先走全文检索（必须结合notes_fts）
+    # SQL示例:
+    # SELECT notes.*
+    # FROM notes JOIN notes_fts ON notes.id = notes_fts.rowid
+    # WHERE notes_fts MATCH 'q' AND author_id=?
+    # AND (is_public=1 if not owner)
+    if q:
+        # 输入 q 转义：SQLite FTS5中不会自动转义，建议只允许字母数字空格
+        fq = re.sub(r'[^\w\s]', ' ', q)
+        fq = fq.strip()
+        if not fq:
+            # q过滤后为空，返回空数组
+            return jsonify([])
+        # 使用原生SQL实现全文搜索并权限过滤
+        sql = text("""
+            SELECT notes.*
+            FROM notes JOIN notes_fts ON notes.id = notes_fts.rowid
+            WHERE notes_fts MATCH :match AND notes.author_id = :uid
+            """ + ("" if current_user_id==user_id else " AND notes.is_public=1 ") + 
+            " ORDER BY rank")
+
+        # rank排序，SQLite FTS5默认可使用 bm25 或 bm25(notes_fts) 函数
+        # SQLite3的默认没有bm25，除非自己扩展。这里用 notes_fts.rank 简单示范。
+        # 这里加 ORDER BY notes.updated_at DESC 以保证有序
+        # 简化写法我们先省略排名函数，最后按更新时间倒序
+        sql = text("""
+            SELECT notes.*
+            FROM notes JOIN notes_fts ON notes.id = notes_fts.rowid
+            WHERE notes_fts MATCH :match AND notes.author_id = :uid
+            """ + ("" if current_user_id==user_id else " AND notes.is_public=1 ") + 
+            " ORDER BY notes.updated_at DESC")
+
+        rows = db.session.execute(sql, {"match":fq, "uid":user_id})
+        notes = []
+        for row in rows:
+            d = dict(row)
+            d["created_at"] = d["created_at"].isoformat()
+            d["updated_at"] = d["updated_at"].isoformat()
+            notes.append({
+                "id": d["id"],
+                "title": d["title"],
+                "content": d["content"],
+                "is_public": bool(d["is_public"]),
+                "created_at": d["created_at"],
+                "updated_at": d["updated_at"],
+            })
+        return jsonify(notes)
+    else:
+        # 不搜索全部笔记，按更新时间倒序
+        notes = base_query.order_by(Note.updated_at.desc()).all()
+        result = []
+        for n in notes:
+            result.append({
+                "id": n.id,
+                "title": n.title,
+                "content": n.content,
+                "is_public": n.is_public,
+                "created_at": n.created_at.isoformat(),
+                "updated_at": n.updated_at.isoformat(),
+            })
+        return jsonify(result)
+# --- 单条笔记查看 ---
+@app.route("/notes/<int:note_id>")
+@jwt_optional
+def note_detail(note_id):
+    n = Note.query.get_or_404(note_id)
+    current_user_id = get_jwt_identity()
+    # 非公开且不是作者，禁止访问
+    if (not n.is_public) and (n.author_id != current_user_id):
+        return jsonify({"msg":"无权限访问"}),403
+    return jsonify({
+        "id": n.id,
+        "title": n.title,
+        "content": n.content,
+        "is_public": n.is_public,
+        "created_at": n.created_at.isoformat(),
+        "updated_at": n.updated_at.isoformat(),
+        "author_id": n.author_id,
+        "author_username": n.author.username
+    })
+# --- 创建笔记 ---
 @app.route("/notes", methods=["POST"])
 @jwt_required()
 def create_note():
     user_id = get_jwt_identity()
-    d = request.get_json()
-    n = Note(author_id=user_id,
-             title=d["title"],
-             content=d["content"],
-             is_public=d.get("is_public", False))
-    db.session.add(n)
+    data = request.json
+    if not data or not data.get("title") or not data.get("content"):
+        return jsonify({"msg":"标题和内容不能为空"}), 400
+    note = Note(
+        author_id=user_id,
+        title=data.get("title"),
+        content=data.get("content"),
+        is_public=bool(data.get("is_public", False))
+    )
+    db.session.add(note)
     db.session.commit()
-    sync_fts(n)
-    return jsonify({"id": n.id}), 201
-
-@app.route("/notes/<int:note_id>", methods=["GET"])
-@jwt_required(optional=True)
-def get_note(note_id):
-    n = Note.query.get_or_404(note_id)
-    cur = get_jwt_identity()
-    if not n.is_public and n.author_id != cur:
-        return jsonify({"msg": "无权限访问"}), 403
-    return jsonify({
-        "id": n.id,
-        "author_id": n.author_id,
-        "title": n.title,
-        "content": n.content,
-        "is_public": n.is_public,
-        "created_at": n.created_at,
-        "updated_at": n.updated_at
-    })
-
+    return jsonify({"id": note.id}), 201
+# --- 更新笔记 ---
 @app.route("/notes/<int:note_id>", methods=["PUT"])
 @jwt_required()
 def update_note(note_id):
     user_id = get_jwt_identity()
-    n = Note.query.get_or_404(note_id)
-    if n.author_id != user_id:
-        return jsonify({"msg": "无权限操作"}), 403
-    d = request.get_json()
-    n.title     = d.get("title", n.title)
-    n.content   = d.get("content", n.content)
-    n.is_public = d.get("is_public", n.is_public)
+    note = Note.query.get_or_404(note_id)
+    if note.author_id != user_id:
+        return jsonify({"msg":"无权限操作"}), 403
+    data = request.json
+    if not data:
+        return jsonify({"msg":"缺少更新内容"}), 400
+    note.title = data.get("title", note.title)
+    note.content = data.get("content", note.content)
+    note.is_public = bool(data.get("is_public", note.is_public))
     db.session.commit()
-    sync_fts(n)
-    return jsonify({"msg": "更新成功"}), 200
-
+    return jsonify({"msg":"更新成功"})
+# --- 删除笔记 ---
 @app.route("/notes/<int:note_id>", methods=["DELETE"])
 @jwt_required()
 def delete_note(note_id):
     user_id = get_jwt_identity()
-    n = Note.query.get_or_404(note_id)
-    if n.author_id != user_id:
-        return jsonify({"msg": "无权限操作"}), 403
-    # 删除 FTS 记录
-    db.session.execute(f"DELETE FROM {FTS_TABLE} WHERE note_id=:nid", {"nid": note_id})
-    db.session.delete(n)
+    note = Note.query.get_or_404(note_id)
+    if note.author_id != user_id:
+        return jsonify({"msg":"无权限操作"}),403
+    db.session.delete(note)
     db.session.commit()
-    return jsonify({"msg": "删除成功"}), 200
-
-# --- 7. 搜索：用户 & 笔记 ---
-@app.route("/search/users", methods=["GET"])
+    return jsonify({"msg":"删除成功"})
+# --- 用户信息接口 ---
+@app.route("/me")
 @jwt_required()
-def search_users():
-    q = request.args.get("q", "")
-    us = User.query.filter(User.username.ilike(f"%{q}%")).all()
-    return jsonify([{"id": u.id, "username": u.username} for u in us]), 200
+def me():
+    user_id = get_jwt_identity()
+    u = User.query.get(user_id)
+    if not u:
+        return jsonify({"msg":"不存在的用户"}),404
+    return jsonify({
+        "id": u.id,
+        "username": u.username,
+        "email": u.email,
+        "created_at": u.created_at.isoformat()
+    })
 
-@app.route("/search/notes", methods=["GET"])
-@jwt_required(optional=True)
-def search_notes():
-    q        = request.args.get("q", "")
-    author   = request.args.get("author_id", type=int)
-    public   = request.args.get("public_only", "true").lower() == "true"
+# --- 前端页面 ---
+@app.route("/")
+def index():
+    return full_html
 
-    # 构造 FTS5 查询
-    where = []
-    params = {}
-    if q:
-        where.append(f"(notes_fts MATCH :q)")
-        params["q"] = q.replace(" ", " OR ")
-    if author is not None:
-        where.append("notes.author_id = :aid")
-        params["aid"] = author
-    if public:
-        where.append("notes.is_public = 1")
-    sql = f"""
-      SELECT notes.id, notes.author_id, notes.title, notes.content
-      FROM notes_fts 
-      JOIN notes ON notes_fts.note_id = notes.id
-      {"WHERE " + " AND ".join(where) if where else ""}
-      ORDER BY rank;
-    """
-    rows = db.session.execute(sql, params).fetchall()
-    result = []
-    for r in rows:
-        result.append({
-            "id": r.id,
-            "author_id": r.author_id,
-            "title": r.title,
-            "snippet": (r.content[:200] + "...") if len(r.content)>200 else r.content
-        })
-    return jsonify(result), 200
+# --- Jinja2模板或静态文件也可，因你要求单文件内嵌，下面转成字符串 ---
 
-# --- 8. 启动 ---
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+full_html = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <title>笔记应用（单文件）</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+    <style>
+    body { font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif; padding: 20px; background:#fafafa; }
+    a { color: #42b983; cursor:pointer; text-decoration: underline; }
+    .nav { padding: 10px 0; border-bottom:1px solid #ddd; margin-bottom: 20px; }
+    .nav a { margin-right: 10px; }
+    .error { color: #c00; }
+    input,textarea { width: 100%; padding: 6px; margin: 4px 0 12px 0; box-sizing: border-box; border:1px solid #ccc; border-radius: 4px; }
+    button { background: #42b983; border:none; color:#fff; padding: 8px 12px; cursor: pointer; border-radius: 4px;}
+    button:disabled { background: #9bd4b8; cursor: not-allowed;}
+    .note { border:1px solid #ddd; padding: 12px; margin-bottom: 10px; border-radius: 6px; background:#fff;}
+    .note h3 { margin: 0 0 6px 0; }
+    .note .meta { color: #666; font-size: 12px; margin-bottom: 6px; }
+    label { font-weight: bold; }
+    </style>
+</head>
+<body>
+<div id="app">
+    <div class="nav" v-if="loggedIn">
+        <a @click="view = 'searchUsers'">搜索用户</a>
+        <a @click="view = 'myNotes'">我的笔记</a>
+        <a @click="logout">退出 ({{ username }})</a>
+    </div>
+    <div v-else class="nav">
+        <a @click="view='login'">登录</a>
+        <a @click="view='register'">注册</a>
+    </div>
+
+    <template v-if="view==='login'">
+        <h2>登录</h2>
+        <div v-if="error" class="error">{{ error }}</div>
+        <input placeholder="用户名或邮箱" v-model="loginForm.username" />
+        <input placeholder="密码" type="password" v-model="loginForm.password" />
+        <button @click="doLogin" :disabled="processing">登录</button>
+        <p>没有账号？<a @click="view='register'">注册</a></p>
+    </template>
+
+    <template v-if="view==='register'">
+        <h2>注册</h2>
+        <div v-if="error" class="error">{{ error }}</div>
+        <input placeholder="用户名" v-model="registerForm.username" />
+        <input placeholder="邮箱" v-model="registerForm.email" />
+        <input placeholder="密码" type="password" v-model="registerForm.password" />
+        <button @click="doRegister" :disabled="processing">注册</button>
+        <p>已有账号？<a @click="view='login'">登录</a></p>
+    </template>
+
+    <template v-if="view==='searchUsers'">
+        <h2>搜索用户</h2>
+        <input placeholder="输入用户名关键字搜索" v-model="userSearchQuery" @input="searchUsers" />
+        <ul>
+            <li v-for="u in searchResults" :key="u.id">
+                <a @click="loadUserNotes(u)">{{ u.username }}</a>
+            </li>
+        </ul>
+        <div v-if="selectedUser">
+            <h3>
+                用户: {{ selectedUser.username }}
+                <button @click="selectedUser=null; notes=[]; noteSearchQuery=''">关闭</button>
+            </h3>
+            <input placeholder="搜索该用户笔记..." v-model="noteSearchQuery" @input="searchUserNotes" />
+            <div v-if="notes.length===0">无笔记</div>
+            <div v-for="note in notes" :key="note.id" class="note">
+                <h3><a @click="viewNote(note)">{{ note.title }}</a></h3>
+                <div class="meta">更新时间: {{ formatDate(note.updated_at) }} | 公共: {{ note.is_public ? '是' : '否' }}</div>
+                <p>{{ note.content.slice(0,150) }}{{ note.content.length>150 ? '...' : '' }}</p>
+            </div>
+        </div>
+    </template>
+
+    <template v-if="view==='myNotes'">
+        <h2>我的笔记</h2>
+        <input placeholder="搜索笔记标题或内容" v-model="noteSearchQuery" @input="searchMyNotes" />
+        <button @click="newNote">+ 新建笔记</button>
+        <div v-if="notes.length===0">无笔记</div>
+        <div v-for="note in notes" :key="note.id" class="note">
+            <h3><a @click="viewNote(note)">{{ note.title }}</a></h3>
+            <div class="meta">更新时间: {{ formatDate(note.updated_at) }} | 公共: {{ note.is_public ? '是' : '否' }}</div>
+            <button @click="editNote(note)">编辑</button>
+            <button @click="deleteNote(note)">删除</button>
+        </div>
+    </template>
+
+    <!-- 查看或编辑笔记模态 -->
+    <template v-if="view==='viewNote'">
+        <h2>{{ editMode ? '编辑笔记' : '查看笔记' }}</h2>
+        <label>标题</label>
+        <input v-model="curNote.title" :readonly="!editMode" />
+        <label>内容</label>
+        <textarea v-model="curNote.content" rows="10" :readonly="!editMode"></textarea>
+        <label><input type="checkbox" v-model="curNote.is_public" :disabled="!editMode"/> 公开笔记</label>
+        <br/>
+        <button v-if="editMode" @click="saveNote">保存</button>
+        <button @click="cancelViewNote">关闭</button>
+    </template>
+</div>
+
+<script>
+const { createApp } = Vue;
+
+createApp({
+    data() {
+        return {
+            view: "login",
+            username: "",
+            token: "",
+            loggedIn: false,
+            error: null,
+            processing: false,
+
+            loginForm: {
+                username: "",
+                password: ""
+            },
+            registerForm: {
+                username: "",
+                email: "",
+                password: ""
+            },
+
+            // 用户搜索相关
+            userSearchQuery: "",
+            searchResults: [],
+            selectedUser: null,
+            notes: [],
+            noteSearchQuery: "",
+
+            // 查看笔记
+            curNote: null,
+            editMode: false
+        }
+    },
+    mounted() {
+        const cachedToken = localStorage.getItem("token");
+        if (cachedToken) {
+            this.token = cachedToken;
+            this.fetchMe();
+        }
+    },
+    methods: {
+        authHeaders() {
+            return { Authorization: "Bearer "+this.token };
+        },
+        async fetchMe(){
+            try {
+                let res = await axios.get("/me", {headers:this.authHeaders()});
+                this.username = res.data.username;
+                this.loggedIn = true;
+                this.view = "myNotes";
+                this.error = null;
+                this.searchMyNotes();
+            } catch(e) {
+                this.logout();
+            }
+        },
+        async doLogin(){
+            this.error = null;
+            this.processing = true;
+            try {
+                let res = await axios.post("/auth/login", this.loginForm);
+                this.token = res.data.access_token;
+                this.username = res.data.username;
+                localStorage.setItem("token", this.token);
+                this.loggedIn = true;
+                this.view = "myNotes";
+                this.loginForm.password = "";
+                this.searchMyNotes();
+            } catch(e) {
+                this.error = e.response?.data?.msg || "登录失败";
+            }
+            this.processing = false;
+        },
+        async doRegister(){
+            this.error = null;
+            this.processing = true;
+            try {
+                await axios.post("/auth/register", this.registerForm);
+                alert("注册成功，请登录");
+                this.view = "login";
+                this.registerForm.password = "";
+            } catch(e) {
+                this.error = e.response?.data?.msg || "注册失败";
+            }
+            this.processing = false;
+        },
+        logout(){
+            this.token = "";
+            this.username = "";
+            this.loggedIn = false;
+            localStorage.removeItem("token");
+            this.view = "login";
+            this.userSearchQuery = "";
+            this.searchResults = [];
+            this.selectedUser = null;
+            this.notes = [];
+            this.noteSearchQuery = "";
+        },
+        async searchUsers(){
+            if(!this.userSearchQuery.trim()){
+                this.searchResults = [];
+                this.selectedUser = null;
+                this.notes = [];
+                return;
+            }
+            try {
+                let res = await axios.get("/users/search", {
+                    params: { q: this.userSearchQuery.trim() },
+                    headers: this.authHeaders()
+                });
+                this.searchResults = res.data;
+            } catch(e) {
+                this.error = "搜索用户失败";
+            }
+        },
+        async loadUserNotes(user){
+            if (!user) return;
+            this.selectedUser = user;
+            this.notes = [];
+            this.noteSearchQuery = "";
+            await this.searchUserNotes();
+        },
+        async searchUserNotes(){
+            if(!this.selectedUser) return;
+            try {
+                let res = await axios.get(`/users/${this.selectedUser.id}/notes`, {
+                    params: { q: this.noteSearchQuery.trim() },
+                    headers: this.authHeaders()
+                });
+                this.notes = res.data;
+            } catch(e){
+                alert("搜索用户笔记失败");
+            }
+        },
+        async searchMyNotes(){
+            if (!this.loggedIn) return;
+            try {
+                let res = await axios.get(`/users/${await this.getMyUserId()}/notes`, {
+                    params: { q: this.noteSearchQuery.trim() },
+                    headers: this.authHeaders()
+                });
+                this.notes = res.data;
+            } catch(e){
+                alert("搜索我的笔记失败");
+            }
+        },
+        async getMyUserId(){
+            if(this._myUserId) return this._myUserId;
+            let res = await axios.get("/me", {headers:this.authHeaders()});
+            this._myUserId = res.data.id;
+            return this._myUserId;
+        },
+        async newNote(){
+            this.editMode = true;
+            this.curNote = {title:"", content:"", is_public:false};
+            this.view = "viewNote";
+        },
+        async viewNote(note){
+            try {
+                let res = await axios.get(`/notes/${note.id}`, {headers:this.authHeaders()});
+                this.curNote = res.data;
+                this.editMode = (this.curNote.author_id === await this.getMyUserId());
+                this.view = "viewNote";
+            } catch(e){
+                alert("读取笔记失败");
+            }
+        },
+        cancelViewNote(){
+            this.curNote = null;
+            this.editMode = false;
+            this.view = this.loggedIn ? "myNotes" : "searchUsers";
+            this.noteSearchQuery = "";
+            if(this.view==="myNotes") this.searchMyNotes();
+            else if(this.selectedUser) this.searchUserNotes();
+        },
+        async saveNote(){
+            if(!this.curNote.title.trim()) {
+                alert("标题不能为空");
+                return;
+            }
+            try {
+                if(this.curNote.id){
+                    // 更新
+                    await axios.put(`/notes/${this.curNote.id}`, {
+                        title: this.curNote.title,
+                        content: this.curNote.content,
+                        is_public: this.curNote.is_public
+                    }, {headers:this.authHeaders()});
+                    alert("更新成功");
+                } else {
+                    // 创建
+                    let res = await axios.post("/notes", {
+                        title: this.curNote.title,
+                        content: this.curNote.content,
+                        is_public: this.curNote.is_public
+                    }, {headers:this.authHeaders()});
+                    this.curNote.id = res.data.id;
+                    alert("创建成功");
+                }
+                this.editMode = false;
+                this.searchMyNotes();
+            } catch(e){
+                alert("保存失败:"+e.response?.data?.msg||e.message);
+            }
+        },
+        async editNote(note){
+            await this.viewNote(note);
+            this.editMode = true;
+        },
+        async deleteNote(note){
+            if(!confirm("确认删除吗？此操作不可恢复")) return;
+            try {
+                await axios.delete(`/notes/${note.id}`, {headers:this.authHeaders()});
+                alert("删除成功");
+                this.searchMyNotes();
+            } catch(e){
+                alert("删除失败");
+            }
+        },
+        formatDate(dtStr){
+            try {
+                let dt = new Date(dtStr);
+                return dt.toLocaleString();
+            } catch {
+                return dtStr;
+            }
+        }
+    }
+}).mount("#app");
+</script>
+</body>
+</html>
+"""
+
+if __name__ == '__main__':
+    db.create_all()
+    setup_fts5()
+    print("启动服务器：http://127.0.0.1:5000")
+    app.run()
