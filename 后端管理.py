@@ -11,7 +11,7 @@ from flask_jwt_extended import (
 )
 from sqlalchemy import event, text
 from sqlalchemy.engine import Engine
-# --- Flask + SQLite + FTS5 配置 ---
+
 app = Flask(__name__)
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///notesapp.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
@@ -19,13 +19,13 @@ app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY","super-secret-key")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(days=7)
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
-### PRAGMA 开启外键
+
 @event.listens_for(Engine, "connect")
 def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
-# --- 数据表 ---
+
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(50), unique=True, nullable=False, index=True)
@@ -38,6 +38,7 @@ class User(db.Model):
 
     def check_password(self, pw:str) -> bool:
         return bcrypt.checkpw(pw.encode(), self.password_hash)
+
 class Note(db.Model):
     __tablename__ = "notes"
     id = db.Column(db.Integer, primary_key=True)
@@ -49,20 +50,12 @@ class Note(db.Model):
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     author = db.relationship("User", backref=db.backref("notes", lazy=True))
-# FTS5 虚拟表，用于全文搜索笔记
-# SQLite 不支持用 ORM 自动创建，手动创建
-# 搜索 match 语法示例:
-# SELECT notes.*
-# FROM notes JOIN notes_fts ON notes.id = notes_fts.rowid
-# WHERE notes_fts MATCH 'searchterm'
-# 监听 SQLAlchemy create_all: 手动创建 FTS 表和 triggers
+
 def setup_fts5():
     with app.app_context():
         conn = db.engine.raw_connection()
         c = conn.cursor()
-        # 创建虚拟表
         c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(title, content, content='notes', content_rowid='id');")
-        # 创建触发器同步 notes -> notes_fts
         c.execute("""
             CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
                 INSERT INTO notes_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
@@ -82,7 +75,7 @@ def setup_fts5():
         conn.commit()
         c.close()
         conn.close()
-# --- 工具函数: LCS 算法 (用户搜索排名) ---
+
 def longest_common_subsequence(a: str, b: str) -> int:
     a = a.lower()
     b = b.lower()
@@ -95,7 +88,7 @@ def longest_common_subsequence(a: str, b: str) -> int:
             else:
                 dp[i+1][j+1] = max(dp[i][j+1], dp[i+1][j])
     return dp[m][n]
-# --- 注册 ---
+
 @app.route("/auth/register", methods=["POST"])
 def register():
     data = request.json
@@ -110,33 +103,35 @@ def register():
     db.session.add(u)
     db.session.commit()
     return jsonify({"msg":"注册成功"}), 201
-# --- 登录 ---
+
 @app.route("/auth/login", methods=["POST"])
 def login():
     data = request.json
     if not data or not data.get("username") or not data.get("password"):
         return jsonify({"msg":"请输入用户名和密码"}), 400
-    # 支持用户名或邮箱登录
     user = User.query.filter((User.username==data['username']) | (User.email==data['username'])).first()
     if not user or not user.check_password(data["password"]):
         return jsonify({"msg":"用户名或密码错误"}), 401
     access_token = create_access_token(identity=user.id)
     return jsonify({"access_token": access_token, "username": user.username})
-# --- 用户搜索接口 使用 LCS 排序 ---
+
+# --- 用户搜索接口 使用 LCS 排序，返回相似度score ---
 @app.route("/users/search")
 @jwt_required()
 def user_search():
     q = request.args.get("q","").strip()
     if not q:
         return jsonify([])
-    # 先模糊匹配，搜索 用户名 包含 q (不区分大小写)
     users = User.query.filter(User.username.ilike(f"%{q}%")).all()
-    # LCS 排序，倒序
-    users.sort(key=lambda u: longest_common_subsequence(u.username, q), reverse=True)
-    # 返回前20条
-    result = [{"id":u.id,"username":u.username} for u in users[:20]]
+    scored = []
+    for u in users:
+        score = longest_common_subsequence(u.username, q)
+        scored.append( (score, u) )
+    scored.sort(key=lambda x: x[0], reverse=True)
+    result = [{"id":u.id,"username":u.username, "score":score} for score,u in scored[:20]]
     return jsonify(result)
-# --- 用户主页获取某个用户笔记, 支持搜索 ---
+
+# --- 用户主页获取某个用户笔记, 支持搜索 并结合标题2倍权重 + 内容1倍权重降序 ---
 @app.route("/users/<int:user_id>/notes")
 @jwt_optional
 def user_notes(user_id):
@@ -144,62 +139,47 @@ def user_notes(user_id):
     current_user_id = get_jwt_identity()
     target_user = User.query.get_or_404(user_id)
 
-    # 选择查询条件
     base_query = Note.query.filter_by(author_id=user_id)
-
-    # 访问者非笔记主人，只能看公开笔记
     if current_user_id != user_id:
         base_query = base_query.filter_by(is_public=True)
 
-    # FTS5全文搜索 如果 q，优先走全文检索（必须结合notes_fts）
-    # SQL示例:
-    # SELECT notes.*
-    # FROM notes JOIN notes_fts ON notes.id = notes_fts.rowid
-    # WHERE notes_fts MATCH 'q' AND author_id=?
-    # AND (is_public=1 if not owner)
     if q:
-        # 输入 q 转义：SQLite FTS5中不会自动转义，建议只允许字母数字空格
-        fq = re.sub(r'[^\w\s]', ' ', q)
-        fq = fq.strip()
+        fq = re.sub(r'[^\w\s]', ' ', q).strip()
         if not fq:
-            # q过滤后为空，返回空数组
             return jsonify([])
-        # 使用原生SQL实现全文搜索并权限过滤
+
         sql = text("""
-            SELECT notes.*
+            SELECT notes.id, notes.title, notes.content, notes.is_public, notes.created_at, notes.updated_at
             FROM notes JOIN notes_fts ON notes.id = notes_fts.rowid
             WHERE notes_fts MATCH :match AND notes.author_id = :uid
-            """ + ("" if current_user_id==user_id else " AND notes.is_public=1 ") + 
-            " ORDER BY rank")
+            """ + ("" if current_user_id==user_id else " AND notes.is_public=1 ") )
+        rows = db.session.execute(sql, {"match": fq, "uid": user_id})
 
-        # rank排序，SQLite FTS5默认可使用 bm25 或 bm25(notes_fts) 函数
-        # SQLite3的默认没有bm25，除非自己扩展。这里用 notes_fts.rank 简单示范。
-        # 这里加 ORDER BY notes.updated_at DESC 以保证有序
-        # 简化写法我们先省略排名函数，最后按更新时间倒序
-        sql = text("""
-            SELECT notes.*
-            FROM notes JOIN notes_fts ON notes.id = notes_fts.rowid
-            WHERE notes_fts MATCH :match AND notes.author_id = :uid
-            """ + ("" if current_user_id==user_id else " AND notes.is_public=1 ") + 
-            " ORDER BY notes.updated_at DESC")
-
-        rows = db.session.execute(sql, {"match":fq, "uid":user_id})
-        notes = []
+        scored_notes = []
         for row in rows:
             d = dict(row)
-            d["created_at"] = d["created_at"].isoformat()
-            d["updated_at"] = d["updated_at"].isoformat()
+            title_score = longest_common_subsequence(d["title"], fq)
+            content_score = longest_common_subsequence(d["content"], fq)
+            total_score = title_score * 2 + content_score
+            if total_score == 0:
+                continue
+            scored_notes.append( (total_score, d) )
+
+        scored_notes.sort(key=lambda x: x[0], reverse=True)
+
+        notes = []
+        for score, d in scored_notes:
             notes.append({
                 "id": d["id"],
                 "title": d["title"],
                 "content": d["content"],
                 "is_public": bool(d["is_public"]),
-                "created_at": d["created_at"],
-                "updated_at": d["updated_at"],
+                "created_at": d["created_at"].isoformat(),
+                "updated_at": d["updated_at"].isoformat(),
+                "score": score
             })
         return jsonify(notes)
     else:
-        # 不搜索全部笔记，按更新时间倒序
         notes = base_query.order_by(Note.updated_at.desc()).all()
         result = []
         for n in notes:
@@ -212,13 +192,12 @@ def user_notes(user_id):
                 "updated_at": n.updated_at.isoformat(),
             })
         return jsonify(result)
-# --- 单条笔记查看 ---
+
 @app.route("/notes/<int:note_id>")
 @jwt_optional
 def note_detail(note_id):
     n = Note.query.get_or_404(note_id)
     current_user_id = get_jwt_identity()
-    # 非公开且不是作者，禁止访问
     if (not n.is_public) and (n.author_id != current_user_id):
         return jsonify({"msg":"无权限访问"}),403
     return jsonify({
@@ -231,7 +210,7 @@ def note_detail(note_id):
         "author_id": n.author_id,
         "author_username": n.author.username
     })
-# --- 创建笔记 ---
+
 @app.route("/notes", methods=["POST"])
 @jwt_required()
 def create_note():
@@ -248,7 +227,7 @@ def create_note():
     db.session.add(note)
     db.session.commit()
     return jsonify({"id": note.id}), 201
-# --- 更新笔记 ---
+
 @app.route("/notes/<int:note_id>", methods=["PUT"])
 @jwt_required()
 def update_note(note_id):
@@ -264,7 +243,7 @@ def update_note(note_id):
     note.is_public = bool(data.get("is_public", note.is_public))
     db.session.commit()
     return jsonify({"msg":"更新成功"})
-# --- 删除笔记 ---
+
 @app.route("/notes/<int:note_id>", methods=["DELETE"])
 @jwt_required()
 def delete_note(note_id):
@@ -275,7 +254,7 @@ def delete_note(note_id):
     db.session.delete(note)
     db.session.commit()
     return jsonify({"msg":"删除成功"})
-# --- 用户信息接口 ---
+
 @app.route("/me")
 @jwt_required()
 def me():
@@ -290,12 +269,9 @@ def me():
         "created_at": u.created_at.isoformat()
     })
 
-# --- 前端页面 ---
 @app.route("/")
 def index():
     return full_html
-
-# --- Jinja2模板或静态文件也可，因你要求单文件内嵌，下面转成字符串 ---
 
 full_html = """
 <!DOCTYPE html>
@@ -356,7 +332,7 @@ full_html = """
         <input placeholder="输入用户名关键字搜索" v-model="userSearchQuery" @input="searchUsers" />
         <ul>
             <li v-for="u in searchResults" :key="u.id">
-                <a @click="loadUserNotes(u)">{{ u.username }}</a>
+                <a @click="loadUserNotes(u)">{{ u.username }} <small v-if="u.score"> (相似度: {{ u.score }})</small></a>
             </li>
         </ul>
         <div v-if="selectedUser">
@@ -367,7 +343,7 @@ full_html = """
             <input placeholder="搜索该用户笔记..." v-model="noteSearchQuery" @input="searchUserNotes" />
             <div v-if="notes.length===0">无笔记</div>
             <div v-for="note in notes" :key="note.id" class="note">
-                <h3><a @click="viewNote(note)">{{ note.title }}</a></h3>
+                <h3><a @click="viewNote(note)">{{ note.title }} <small v-if="note.score">(得分: {{ note.score }})</small></a></h3>
                 <div class="meta">更新时间: {{ formatDate(note.updated_at) }} | 公共: {{ note.is_public ? '是' : '否' }}</div>
                 <p>{{ note.content.slice(0,150) }}{{ note.content.length>150 ? '...' : '' }}</p>
             </div>
@@ -387,7 +363,6 @@ full_html = """
         </div>
     </template>
 
-    <!-- 查看或编辑笔记模态 -->
     <template v-if="view==='viewNote'">
         <h2>{{ editMode ? '编辑笔记' : '查看笔记' }}</h2>
         <label>标题</label>
@@ -413,7 +388,6 @@ createApp({
             loggedIn: false,
             error: null,
             processing: false,
-
             loginForm: {
                 username: "",
                 password: ""
@@ -423,15 +397,11 @@ createApp({
                 email: "",
                 password: ""
             },
-
-            // 用户搜索相关
             userSearchQuery: "",
             searchResults: [],
             selectedUser: null,
             notes: [],
             noteSearchQuery: "",
-
-            // 查看笔记
             curNote: null,
             editMode: false
         }
@@ -585,7 +555,6 @@ createApp({
             }
             try {
                 if(this.curNote.id){
-                    // 更新
                     await axios.put(`/notes/${this.curNote.id}`, {
                         title: this.curNote.title,
                         content: this.curNote.content,
@@ -593,7 +562,6 @@ createApp({
                     }, {headers:this.authHeaders()});
                     alert("更新成功");
                 } else {
-                    // 创建
                     let res = await axios.post("/notes", {
                         title: this.curNote.title,
                         content: this.curNote.content,
