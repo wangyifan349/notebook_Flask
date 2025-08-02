@@ -10,13 +10,13 @@ UPLOAD_FOLDER = 'uploads'
 ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv'}
 
 app = Flask(__name__)
-app.secret_key = 'your_secret_key'  # 你应替换成安全的
+app.secret_key = 'your_secret_key'  # 请改成你自己的安全密钥
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 
-# 将你的所有html模板放这里，每个值是对应的模板字符串
+# ------------------ 这里写所有模板 ------------------
 templates = {
     'base.html': '''
 <!DOCTYPE html>
@@ -26,7 +26,6 @@ templates = {
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>短视频平台</title>
 <style>
-/* 你的 base.html 样式代码保持不变，放这里 */
 body {
   font-family: Arial, sans-serif;
   margin: 0;
@@ -219,10 +218,9 @@ button {
 ''',
 }
 
-# Configure flask template loader to use the above dict
 app.jinja_loader = DictLoader(templates)
 
-# ------------------- 其余部分和之前一致 -------------------
+# ---------- 下面是应用逻辑 ----------
 
 def get_db():
     db = getattr(g, '_database', None)
@@ -240,8 +238,20 @@ def close_connection(exception):
 def init_db():
     db = get_db()
     cursor = db.cursor()
-    cursor.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL)")
-    cursor.execute("CREATE TABLE IF NOT EXISTS videos (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, filename TEXT NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id))")
+    cursor.execute('''
+      CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL
+      )''')
+    cursor.execute('''
+      CREATE TABLE IF NOT EXISTS videos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        filename TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+      )
+    ''')
     db.commit()
 
 def allowed_file(filename):
