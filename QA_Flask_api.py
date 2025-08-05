@@ -1,191 +1,189 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 from sentence_transformers import SentenceTransformer
 import numpy as np
 import faiss
 
 app = Flask(__name__)
 
-# 内存中的 QA 数据
+
 QA_DATA = [
     {
-        "question": """硬拉的正确姿势是什么？""",
-        "answer": """硬拉时保持背部平直，臀部向后，下蹲抓杠，双手与肩同宽或略宽。起杠时先用腿部和臀部发力，杠铃沿腿部贴近身体上升，顶臀站直后再缓慢放下，始终保持核心收紧，避免腰部过度前屈或后仰。"""
+        "question": "如何计算两张人脸图片的相似度？",
+        "answer": """使用预训练的人脸嵌入模型（如FaceNet、ArcFace）将人脸图像编码成固定长度的特征向量，然后通过余弦相似度衡量向量之间的相似性。步骤包括：
+1. 预处理：裁剪并缩放人脸图像至模型输入尺寸（通常为160×160），归一化像素值到[0,1]区间。
+2. 提取特征向量：使用模型前向计算得到人脸嵌入（embedding）。
+3. 计算相似度：两向量的余弦相似度（Cosine Similarity）值在-1到1之间，越接近1表示越相似。
+
+示例代码：
+```python
+from facenet_pytorch import InceptionResnetV1
+from PIL import Image
+import torch
+import numpy as np
+
+# 1. 加载预训练模型
+model = InceptionResnetV1(pretrained='vggface2').eval()
+
+def preprocess(image_path):
+    img = Image.open(image_path).convert('RGB').resize((160, 160))
+    arr = np.asarray(img) / 255.0
+    tensor = torch.tensor(arr, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
+    return tensor
+
+def get_embedding(image_path):
+    tensor = preprocess(image_path)
+    with torch.no_grad():
+        embedding = model(tensor)
+    # 返回1D向量
+    return embedding.numpy()[0]
+
+def cosine_similarity(vec1, vec2):
+    dot = np.dot(vec1, vec2)
+    norm1 = np.linalg.norm(vec1)
+    norm2 = np.linalg.norm(vec2)
+    return dot / (norm1 * norm2)
+
+# 示例调用
+emb1 = get_embedding("face1.jpg")
+emb2 = get_embedding("face2.jpg")
+sim = cosine_similarity(emb1, emb2)
+print(f"相似度: {sim:.4f}")  # 通常大于0.7可认为为同一人
+```"""
     },
     {
-        "question": """卧推时如何避免肩部受伤？""",
-        "answer": """握距略比肩宽，臂肘在下放时与身体保持约45°夹角，下放至胸部中部位置，保持手腕中立位，肩胛骨向内下方收紧并贴紧长凳。发力时脚稳踩地面，核心收紧，推起时手腕、肘部和肩关节在一条直线上，避免内旋或外旋过度。"""
+        "question": "如何使用OpenCV和dlib实现人脸检测并对齐？",
+        "answer": """通过dlib检测人脸并定位关键点，再使用OpenCV的仿射变换（affine transform）将关键点映射到标准位置，实现人脸对齐。主要流程：
+1. 加载dlib的HOG+SVM人脸检测器和关键点预测器（5或68点模型）。
+2. 检测输入图像中的人脸区域。
+3. 获取人脸关键点坐标，选取眼角、鼻尖、嘴角等关键点。
+4. 根据预定义的目标关键点位置，计算仿射矩阵并对图像进行变换。
+
+示例代码：
+```python
+import cv2
+import dlib
+import numpy as np
+
+# 初始化人脸检测器和5点关键点预测器
+detector = dlib.get_frontal_face_detector()
+predictor = dlib.shape_predictor("shape_predictor_5_face_landmarks.dat")
+
+def align_face(image_path, output_size=(160, 160)):
+    img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    faces = detector(gray, 1)
+    if not faces:
+        return None
+
+    # 取第一张人脸
+    face = faces[0]
+    landmarks = predictor(gray, face)
+    src = np.array([[p.x, p.y] for p in landmarks.parts()], dtype=np.float32)
+
+    # 标准5点坐标（参考MTCNN或ArcFace标准）
+    dst = np.array([
+        [38.2946, 51.6963],
+        [73.5318, 51.5014],
+        [56.0252, 71.7366],
+        [41.5493, 92.3655],
+        [70.7299, 92.2041]
+    ], dtype=np.float32)
+
+    # 计算仿射矩阵并对齐
+    M = cv2.estimateAffinePartial2D(src, dst, method=cv2.LMEDS)[0]
+    aligned = cv2.warpAffine(img, M, output_size, borderValue=(0, 0, 0))
+    return aligned
+
+aligned = align_face("face.jpg")
+if aligned is not None:
+    cv2.imwrite("aligned_face.jpg", aligned)
+    print("对齐完成，保存为 aligned_face.jpg")
+else:
+    print("未检测到人脸") 
+```"""
     },
     {
-        "question": """如何有效增长肌肉？""",
-        "answer": """1. 渐进式超负荷训练：每周或每次训练逐步增加重量、次数或组数；  
-2. 蛋白质摄入：每日每公斤体重摄入约1.6–2.2克优质蛋白（如乳清、鸡胸肉、鱼肉、蛋类等）；  
-3. 碳水与脂肪：保证充足能量供给，碳水占总热量的45–60%，健康脂肪占20–35%；  
-4. 维生素与矿物质：维生素D、B族（如烟酰胺/维生素B3）和钙、镁、锌等有助于能量代谢、肌肉收缩与恢复；  
-5. 充分休息：每晚7–9小时睡眠，训练后局部肌群至少48小时恢复。"""
+        "question": "如何基于OpenCV实现实时人脸识别？",
+        "answer": """在摄像头实时视频流中检测、对齐并识别人脸，通常流程是：
+1. 打开摄像头并逐帧读取图像。
+2. 使用Haar级联或DNN检测人脸。
+3. 对检测到的人脸图像进行对齐及预处理。
+4. 提取人脸特征向量并与数据库中已知人脸向量计算相似度。
+5. 根据阈值判断身份并显示结果。
+
+示例代码：
+```python
+import cv2
+from facenet_pytorch import InceptionResnetV1
+import numpy as np
+
+# 初始化模型和摄像头
+model = InceptionResnetV1(pretrained='vggface2').eval()
+cap = cv2.VideoCapture(0)
+known_embeddings = {...}  # 预先计算好的名称->向量字典
+
+def get_embedding(face_img):
+    img = cv2.resize(face_img, (160,160)) / 255.0
+    tensor = torch.tensor(img, dtype=torch.float32).permute(2,0,1).unsqueeze(0)
+    with torch.no_grad():
+        return model(tensor).numpy()[0]
+
+def recognize(emb):
+    best_name, best_score = None, -1
+    for name, db_emb in known_embeddings.items():
+        score = np.dot(emb, db_emb) / (np.linalg.norm(emb)*np.linalg.norm(db_emb))
+        if score > best_score:
+            best_name, best_score = name, score
+    return best_name if best_score > 0.7 else "Unknown"
+
+while True:
+    ret, frame = cap.read()
+    if not ret: break
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # 使用Haar或DNN检测
+    faces = cv2.CascadeClassifier('haarcascade_frontalface_default.xml') \
+                   .detectMultiScale(gray,1.3,5)
+    for (x,y,w,h) in faces:
+        face_img = frame[y:y+h, x:x+w]
+        emb = get_embedding(face_img)
+        name = recognize(emb)
+        cv2.rectangle(frame, (x,y),(x+w,y+h),(0,255,0),2)
+        cv2.putText(frame, name, (x,y-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0),2)
+    cv2.imshow("Face Recognition", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+```"""
     },
-    {
-        "question": """复合训练（Compound Exercises）是什么？""",
-        "answer": """复合训练指同时动用多个关节和肌群的动作，例如深蹲（膝、髋）、硬拉（髋、膝、肩）和卧推（肘、肩）。此类动作能更高效地提升全身力量、加速代谢，并增强神经肌肉协调性。"""
-    },
-    {
-        "question": """烟酰胺（维生素B3）在健身中的作用？""",
-        "answer": """烟酰胺是维生素B3的一种形式，参与NAD⁺/NADH的合成，关键于细胞能量代谢和修复。充足的烟酰胺有助于提升有氧和无氧运动的耐力及恢复，缺乏时可能造成疲劳、皮肤和神经系统问题。"""
-    },
-    {
-        "question": """如何搭配维生素D进行健身营养补给？""",
-        "answer": """维生素D促进钙吸收、维持骨骼健康，有助于肌肉功能。健身人群可每天补充800–2000 IU维生素D₃，或通过晒太阳（每天10–30分钟无防晒直晒面、手臂），并确保膳食中有富含维生素D的食物（深海鱼、蛋黄、强化奶制品）。"""
-    },
-    {
-        "question": """如何制定一周的健身房训练计划？""",
-        "answer": """- 推/拉/腿分割：周一推（胸、肩、三头）、周二拉（背、二头）、周三腿部（深蹲、硬拉变体）、周四休息、周五推、周六拉、周日休息；  
-- 上/下肢分割：周一上肢、周二下肢、周三休息、周四上肢、周五下肢；  
-- 全身训练：每次训练覆盖主要肌群，隔天训练，保证每周2–3次；  
-根据个人目标和恢复情况调整负荷、组次和休息时长。"""
-    }
 ]
 
-QA_DATA += [
-    {
-        "question": """蛋白质在肌肉合成中的作用是什么？""",
-        "answer": """蛋白质是由20种氨基酸组成的生物大分子，其中9种为必需氨基酸，必须通过膳食获得。力量训练会造成肌纤维微损伤，身体通过肌蛋白合成（MPS）来修复和增厚这些纤维，从而实现肌肉增长。膳食蛋白质被消化分解为氨基酸，进入血液后被肌细胞摄取，亮氨酸等关键氨基酸激活mTOR信号通路，启动蛋白质合成。若摄入蛋白不足，则MPS受限，肌肉恢复和生长效果不佳。"""
-    },
-    {
-        "question": """什么是支链氨基酸（BCAA），它们为什么重要？""",
-        "answer": """BCAA包括亮氨酸(leucine)、异亮氨酸(isoleucine)和缬氨酸(valine)，约占肌肉中必需氨基酸的35%。与其他氨基酸不同，BCAA主要在骨骼肌而非肝脏中代谢。  
-- 亮氨酸：最强的mTOR激活剂，直接启动蛋白质合成。  
-- 异亮氨酸和缬氨酸：参与能量供应、糖异生及调节血糖水平，有助于延缓疲劳。  
-训练前或训练中补充BCAA可减少肌肉分解、提升耐力和延缓疲劳感。"""
-    },
-    {
-        "question": """为什么亮氨酸对增肌尤为关键？""",
-        "answer": """亮氨酸是三支链氨基酸中mTORC1（哺乳动物雷帕霉素靶蛋白复合体1）最有效的激活剂。当细胞内亮氨酸浓度达到阈值时，mTORC1被激活，促进核糖体生物合成和翻译起始因子活化，显著提高肌蛋白合成速率。研究显示，每餐摄入约2–3克亮氨酸（约20–30克高质量蛋白）可最大化MPS反应。"""
-    },
-    {
-        "question": """蛋白质摄入的最佳时机是什么？""",
-        "answer": """最佳时机：  
-1. 训练后30–60分钟（“蛋白质窗口期”）：此时肌肉对氨基酸的敏感度最高，摄入20–40克快吸收蛋白（如乳清蛋白）可快速提升血氨基酸浓度，促进MPS；  
-2. 睡前：摄入20–40克缓吸收蛋白（如酪蛋白）可在夜间持续释放氨基酸，降低夜间肌蛋白分解（MPB）；  
-3. 分餐摄入：将每日总蛋白量（1.6–2.2克/公斤体重）均分到3–5餐，每餐保证至少0.4–0.55克/公斤体重，有助于维持全天MPS水平。"""
-    },
-    {
-        "question": """肌蛋白合成（MPS）和肌蛋白分解（MPB）的平衡如何影响肌肉生长？""",
-        "answer": """肌肉净合成取决于MPS与MPB的差值：  
-- 当MPS > MPB 时，肌肉处于正氮平衡，肌纤维合成超过分解，体积和力量增加；  
-- 当MPS ≤ MPB 时，肌肉不会增长甚至流失。  
-影响因素：  
-1. 机械张力（训练强度、体积）  
-2. 氨基酸及总热量摄入（热量盈余、优质蛋白）  
-3. 激素环境（胰岛素、睾酮、生长激素）  
-4. 恢复与睡眠（生长激素分泌、细胞修复）  
-综合优化这些因素才能实现最佳增肌效果。"""
-    },
-    {
-        "question": """如何通过饮食优化BCAA 的摄入？""",
-        "answer": """天然食物来源：  
-- 动物蛋白：牛肉、鸡胸肉、鱼、蛋、乳清、酪蛋白；  
-- 植物蛋白：大豆、豌豆蛋白（含量略低，但可与谷物互补提高氨基酸评分）。  
-补剂策略：  
-- 训练前/中：5–10克BCAA，延缓疲劳、减少肌肉分解；  
-- 训练后：可用含全量必需氨基酸（EAA）或乳清蛋白，确保除BCAA外其他氨基酸也充足；  
-注意：长期单独高剂量BCAA补充会掩盖其他必需氨基酸，建议与完整蛋白或EAA合用。"""
-    }
-]
 
-
-
-QA_DATA += [
-    {
-        "question": """什么是抗生素？它们如何发挥作用？""",
-        "answer": """抗生素（Antibiotics）是一类用来对抗细菌感染的药物，主要通过以下几种机制抑制或杀灭细菌：  
-1. 干扰细菌细胞壁合成（如青霉素、头孢菌素），导致细胞壁弱化、裂解；  
-2. 抑制蛋白质合成（如四环素、氯霉素、氨基糖苷类），通过结合细菌核糖体阻断翻译；  
-3. 抑制核酸合成（如喹诺酮类抑制DNA旋转酶、利福平抑制RNA聚合酶）；  
-4. 干扰叶酸代谢（如磺胺类、甲氧苄啶），阻止核酸和蛋白质合成。  
-注意：抗生素只对细菌有效，对病毒无效；滥用可导致耐药性产生。"""
-    },
-    {
-        "question": """什么是抗病毒药物？它们的基本原理是什么？""",
-        "answer": """抗病毒药物（Antivirals）针对病毒的复制周期设计，常见作用机制包括：  
-1. 抑制病毒进入或与宿主细胞融合（如恩替卡韦用于乙型肝炎病毒）；  
-2. 阻断病毒基因组复制（如阿昔洛韦抑制疱疹病毒DNA聚合酶、拉米夫定针对逆转录酶）；  
-3. 干扰病毒蛋白加工或装配（如达芦那韦抑制HIV蛋白酶）；  
-4. 调节宿主免疫反应（如干扰素增强抗病毒状态）。  
-抗病毒药物需靶向病毒或宿主关键酶，具有较高选择性，以减少对机体细胞的毒性。"""
-    },
-    {
-        "question": """先天免疫和获得性免疫有什么区别？""",
-        "answer": """先天免疫（Innate Immunity）与获得性免疫（Adaptive Immunity）的主要区别：  
-1. 反应速度：先天免疫快速（分钟–小时），获得性免疫较慢（天–周）；  
-2. 特异性：先天免疫对病原体识别非特异，依赖模式识别受体（TLR等）；获得性免疫高度特异，通过T细胞受体和B细胞抗体识别特定抗原；  
-3. 记忆性：先天免疫无免疫记忆，获得性免疫具有记忆，可在二次感染时快速应答；  
-4. 主要成分：先天免疫包括物理屏障（皮肤、黏膜）、吞噬细胞（巨噬细胞、中性粒细胞）、NK细胞、补体；获得性免疫由T细胞（CD4⁺辅助、CD8⁺细胞毒）和B细胞（分泌抗体）主导。"""
-    },
-    {
-        "question": """免疫系统中的关键细胞类型有哪些？""",
-        "answer": """免疫系统主要由以下几类细胞构成：  
-1. 中性粒细胞（Neutrophils）：先天免疫一线吞噬菌；  
-2. 单核/巨噬细胞（Monocytes/Macrophages）：吞噬病原体并抗原呈递；  
-3. 树突状细胞（Dendritic Cells）：高效抗原呈递细胞，激活T细胞；  
-4. NK细胞（Natural Killer Cells）：针对感染或肿瘤细胞的天然细胞毒；  
-5. T淋巴细胞（T Cells）：CD4⁺辅助T细胞协调免疫；CD8⁺细胞毒T细胞杀死被感染细胞；  
-6. B淋巴细胞（B Cells）：分化为浆细胞，产生抗体中和病原体。  
-这些细胞通过细胞因子和直接细胞接触共同完成免疫防御。"""
-    },
-    {
-        "question": """什么是疫苗，它如何激发免疫保护？""",
-        "answer": """疫苗（Vaccine）利用灭活或减毒病原体、病原体片段或基因序列（mRNA、病毒载体）模拟自然感染，激活获得性免疫：  
-1. 抗原呈递：树突状细胞摄取疫苗成分并向淋巴结迁移；  
-2. T细胞和B细胞活化：CD4⁺辅助T细胞分泌细胞因子，促进B细胞成熟为抗体分泌的浆细胞；CD8⁺细胞毒T细胞获得杀菌或杀病毒能力；  
-3. 免疫记忆：形成记忆T、B细胞，二次接触病原体时能迅速增殖并产生大量中和抗体，实现持久保护。  
-合理接种可显著降低感染率、重症率和病死率。"""
-    }
-]
-
-
-
-
-
-corpus_questions = []
-for item in QA_DATA:
-    corpus_questions.append(item["question"])
-
-# 加载多语种 MPNet 嵌入模型
-MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
-embedder = SentenceTransformer(MODEL)
-
-# 对语料做向量化并归一化
+# ==== 2. 加载模型，构建索引 ====
+MODEL_NAME = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+embedder = SentenceTransformer(MODEL_NAME)
+corpus_questions = [item["question"] for item in QA_DATA]
 corpus_embeddings = embedder.encode(corpus_questions, convert_to_numpy=True, normalize_embeddings=True)
 dim = corpus_embeddings.shape[1]
-
-# 用 FAISS 建立 IndexFlatIP 索引（内积＝余弦相似度）
 index = faiss.IndexFlatIP(dim)
 index.add(corpus_embeddings)
-
+# ==== 3. 后端搜索接口 ====
 @app.route('/search', methods=['POST'])
 def search():
     data = request.get_json(force=True)
     q = data.get("q", "").strip()
     k = int(data.get("k", 1))
-
     if not q:
         return jsonify({"error": "字段 'q' 不能为空"}), 400
-    if k < 1:
-        return jsonify({"error": "字段 'k' 必须 >= 1"}), 400
-
-    # 将查询向量化并归一化
+    if k < 1 or k > 5:
+        return jsonify({"error": "字段 'k' 必须在1-5之间"}), 400
     q_emb = embedder.encode([q], convert_to_numpy=True, normalize_embeddings=True)
-
-    # 在 FAISS 索引中检索 top-k
     scores, idxs = index.search(q_emb, k)
-    scores = scores.flatten()
-    idxs = idxs.flatten()
-
-    # 构造返回
     results = []
-    for i in range(len(scores)):
-        score = scores[i]
-        idx = idxs[i]
-        qa = QA_DATA[int(idx)]
+    for score, idx in zip(scores.flatten(), idxs.flatten()):
+        qa = QA_DATA[idx]
         results.append({
             "question": qa["question"],
             "answer": qa["answer"],
@@ -194,5 +192,179 @@ def search():
 
     return jsonify(results)
 
-if __name__ == "__main__":
+# ==== 4. 前端页面 HTML + JS，支持代码块高亮 ====
+
+# 使用 highlight.js CDN，自动高亮页面里的 <pre><code> 代码块
+
+INDEX_HTML = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <title>在线问答系统</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f9f9f9; }
+        h1 { color: #222; }
+        #qa-form { margin-bottom: 20px; }
+        #results { background: #fff; padding: 15px; border-radius: 6px; box-shadow: 0 0 8px #ccc; max-width: 800px; }
+        .result { margin-bottom: 20px; border-bottom: 1px solid #eee; padding-bottom: 15px; }
+        .question { font-weight: bold; color: #2a6ebb; }
+        .answer { margin-top: 8px; white-space: pre-wrap; font-size: 14px; color: #333; }
+        label { margin-right: 10px; }
+        input[type=text] { width: 60%; padding: 6px 8px; font-size: 14px; }
+        input[type=number] { width: 50px; padding: 6px 8px; font-size: 14px; }
+        button { padding: 6px 16px; font-size: 14px; cursor: pointer; }
+        #error { color: red; margin-bottom: 10px; }
+        pre { background: #272822; color: #f8f8f2; padding: 10px; border-radius: 4px; overflow-x: auto; }
+    </style>
+
+    <!-- highlight.js 样式 & 库 -->
+    <link rel="stylesheet"
+          href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/vs2015.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+    <script>hljs.highlightAll();</script>
+</head>
+<body>
+    <h1>中文健身与医学问答系统</h1>
+    <div id="error"></div>
+    <form id="qa-form" onsubmit="return false;">
+        <label for="question">请输入您的问题：</label><br/>
+        <input type="text" id="question" name="question" placeholder="例如：Python如何读文件？" required />
+        <label for="topk">返回条数：</label>
+        <input type="number" id="topk" name="topk" value="1" min="1" max="5" />
+        <button type="submit">查询</button>
+    </form>
+    <div id="results"></div>
+
+<script>
+document.getElementById('qa-form').addEventListener('submit', async () => {
+    const q = document.getElementById('question').value.trim();
+    const k = parseInt(document.getElementById('topk').value);
+    const errorDiv = document.getElementById('error');
+    const resultsDiv = document.getElementById('results');
+    errorDiv.textContent = '';
+    resultsDiv.innerHTML = '';
+
+    if (!q) {
+        errorDiv.textContent = "请输入有效的问题！";
+        return;
+    }
+    if (k < 1 || k > 5) {
+        errorDiv.textContent = "返回条数必须在1到5之间。";
+        return;
+    }
+
+    try {
+        resultsDiv.innerHTML = "<p>正在查询，请稍候...</p>";
+        const response = await fetch('/search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ q: q, k: k })
+        });
+
+        if (!response.ok) {
+            const err = await response.json();
+            errorDiv.textContent = err.error || '查询出现错误！';
+            resultsDiv.innerHTML = '';
+            return;
+        }
+
+        const data = await response.json();
+
+        if (!data.length) {
+            resultsDiv.textContent = "未找到相关答案。";
+            return;
+        }
+
+        // 为了确保代码块的三引号被正确转成 <pre><code>，做简单转换
+        // 服务器端答案中代码块格式均为三引号python代码块，我们把 ```python ... ``` 转成 <pre><code class="language-python"> ... </code></pre>
+        function escapeHtml(text) {
+            var map = {
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#039;'
+            };
+            return text.replace(/[&<>"']/g, function(m) { return map[m]; });
+        }
+
+        function convertMarkdownCodeBlocks(text) {
+            // 先转义html
+            text = escapeHtml(text);
+
+            // 转换 ```python ... ``` 或 ``` ... ```
+            return text.replace(/```(\\w*)\\n([\\s\\S]*?)```/g,
+                function(match, lang, code) {
+                    lang = lang || '';
+                    return `<pre><code class="language-${lang}">${code}</code></pre>`;
+                });
+        }
+
+        // 由于JS 正则不支持 \w，需要稍作修改：
+        function convertCodeBlocks(text){
+            text = escapeHtml(text)
+            // ```python\ncode\n``` 代码块正则
+            return text.replace(/```(\\w*)\\n([\\s\\S]*?)```/gm, function(match, lang, code){
+                lang = lang || '';
+                return `<pre><code class="language-${lang}">${code}</code></pre>`;
+            }).replace(/```([\\s\\S]*?)```/gm,function(match,code){ // 无语言声明的代码块
+                code = match.replace(/```/g,"");
+                return `<pre><code>${code}</code></pre>`;
+            });
+        }
+
+        let htmlResults = data.map(item => {
+            // 将答案中的三引号代码块替换为 <pre><code> 供 highlihgt.js高亮
+            // 因为后端字符串中的三引号语法是 ```, frag 直接替换即可
+            // 这里用正则替换
+            let ansHtml = item.answer
+                .replace(/```(\\w+)?\\n([\\s\\S]*?)```/g, function(_, lang = '', code){
+                    lang = lang.trim() || 'plaintext';
+                    // 注意html转义
+                    const escapedCode = code.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+                    return `<pre><code class="language-${lang}">${escapedCode}</code></pre>`;
+                });
+
+            // 还要把没有语言声明的代码块 ``` ... ``` 也处理
+            ansHtml = ansHtml.replace(/```([\\s\\S]*?)```/g, function(_, code) {
+                const escapedCode = code.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+                return `<pre><code>${escapedCode}</code></pre>`;
+            });
+
+            // 转义其他非代码内容 (换行保留)
+            // 为了简单，先替换答案中所有剩余 & < > 等
+            // 注意不能转义代码块内部内容，否则会影响显示，所以先用代码块分隔
+            // 因为可以覆盖，先不做多余复杂分割
+
+
+            return `
+            <div class="result">
+                <div class="question">问：${item.question}</div>
+                <div class="answer">${ansHtml}</div>
+                <div><small>匹配度：${item.score}</small></div>
+            </div>
+            `;
+        }).join('');
+
+        resultsDiv.innerHTML = htmlResults;
+        // 重新调用高亮
+        hljs.highlightAll();
+
+    } catch (e) {
+        errorDiv.textContent = "查询异常：" + e.message;
+        resultsDiv.innerHTML = '';
+    }
+});
+</script>
+
+
+</body>
+</html>
+"""
+@app.route('/')
+def index():
+    return render_template_string(INDEX_HTML)
+# ==== 5. 入口 ====
+if __name__ == '__main__':
     app.run(port=5000, debug=True)
