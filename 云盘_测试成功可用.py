@@ -318,14 +318,8 @@ def shared_browser(token, subpath):
     else:
         directory, filename = os.path.split(absolute_path)
         return send_from_directory(directory, filename, as_attachment=True)
-
-
 # ─── Templates ────────────────────────────────────────────────────────────────
-
-# 我只把模板部分和新增JS脚本给你，你替换下你代码里对应部分即可
-
 # ─── 修改后的 BASE_TEMPLATE（主框架） ──────────────────────────────
-
 BASE_TEMPLATE = """
 <!doctype html>
 <html lang="zh">
@@ -745,12 +739,7 @@ SHARED_TEMPLATE = """
   </tbody>
 </table>
 """
-
-
-
-
 # ─── Run ───────────────────────────────────────────────────────────────────────
-
 if __name__ == '__main__':
     initialize_database()
     app.run(debug=False)
