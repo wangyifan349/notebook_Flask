@@ -1,0 +1,309 @@
+import os
+import shutil
+import io
+import zipfile
+from flask import (
+    Flask, request, jsonify, send_file,
+    render_template_string, abort
+)
+
+# —— 配置区 —— #
+app = Flask(__name__)
+# 存储根目录
+ROOT = os.path.join(os.path.dirname(__file__), 'storage')
+os.makedirs(ROOT, exist_ok=True)
+
+# —— 前端模板 —— #
+# 使用 render_template_string 渲染，内含 HTML、CSS、JS
+TEMPLATE = """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Flask 单文件网盘</title>
+  <style>
+    body { font-family: Arial; padding: 20px; }
+    ul { list-style: none; padding-left: 20px; }
+    li { margin: 5px; cursor: pointer; }
+    .folder::before { content: "📁 "; }
+    .file::before   { content: "📄 "; }
+    .dragging { opacity: 0.5; }
+    .breadcrumb a { margin-right: 8px; text-decoration: none; color: #0066cc; }
+  </style>
+</head>
+<body>
+  <h1>Flask 单文件网盘</h1>
+  <div class="breadcrumb"></div>
+  <button onclick="createFolder()">新建文件夹</button>
+  <input type="file" id="uploader">
+  <button onclick="uploadFile()">上传文件</button>
+  <button onclick="refresh()">刷新</button>
+  <div id="tree"></div>
+
+<script>
+// 当前浏览路径（相对于根目录）
+let cwd = "";
+
+// 初始化：加载列表和面包屑
+window.onload = () => {
+  refresh();
+};
+
+// 更新文件树视图
+function refresh() {
+  fetch(`/api/tree?path=${encodeURIComponent(cwd)}`)
+    .then(res => res.json())
+    .then(renderTree);
+  renderBreadcrumb();
+}
+
+// 渲染面包屑导航
+function renderBreadcrumb() {
+  const container = document.querySelector('.breadcrumb');
+  container.innerHTML = '';
+  // “根目录”链接
+  container.appendChild(makeCrumb('', '根目录'));
+  // 拆分子路径，逐级添加
+  const parts = cwd.split('/').filter(p => p);
+  let accum = '';
+  parts.forEach(name => {
+    accum += name + '/';
+    container.appendChild(makeCrumb(accum, name));
+  });
+}
+
+// 构造单个面包屑链接
+function makeCrumb(path, label) {
+  const a = document.createElement('a');
+  a.textContent = label;
+  a.href = '#';
+  a.onclick = () => { cwd = path; refresh(); };
+  return a;
+}
+
+// 渲染目录/文件列表
+function renderTree(items) {
+  const tree = document.getElementById('tree');
+  tree.innerHTML = '';
+  const ul = document.createElement('ul');
+
+  items.forEach(item => {
+    const li = document.createElement('li');
+    li.textContent = item.name;
+    li.className = item.type;
+    li.draggable = true;
+
+    // 双击：进入文件夹或下载文件/打包文件夹
+    li.ondblclick = () => {
+      if (item.type === 'folder') {
+        cwd += item.name + '/';
+        refresh();
+      } else {
+        window.location = `/api/download?path=${encodeURIComponent(cwd + item.name)}`;
+      }
+    };
+
+    // 右键：重命名 / 删除 / 复制 等操作
+    li.oncontextmenu = e => {
+      e.preventDefault();
+      const action = prompt('操作 (rename/delete/copy):', 'rename');
+      if (!action) return;
+
+      // 数据初始化
+      const data = { path: cwd + item.name };
+
+      if (action === 'rename') {
+        const newname = prompt('新名称：', item.name);
+        if (!newname) return;
+        data.newname = newname;
+      }
+      if (action === 'copy') {
+        const dest = prompt('复制到路径（相对根）：', cwd);
+        if (!dest) return;
+        data.dest = dest;
+      }
+      callApi(action, data);
+    };
+
+    // 拖拽移动
+    li.ondragstart = e => {
+      e.dataTransfer.setData('text/plain', cwd + item.name);
+      li.classList.add('dragging');
+    };
+    li.ondragend = () => li.classList.remove('dragging');
+    li.ondragover = e => e.preventDefault();
+    li.ondrop = e => {
+      e.preventDefault();
+      const src = e.dataTransfer.getData('text/plain');
+      const dest = cwd;
+      callApi('move', { src, dest });
+    };
+
+    ul.appendChild(li);
+  });
+
+  tree.appendChild(ul);
+}
+
+// 统一调用后端 API
+function callApi(action, data) {
+  fetch(`/api/${action}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data)
+  }).then(refresh);
+}
+
+// 创建文件夹
+function createFolder() {
+  const name = prompt('文件夹名称：');
+  if (name) callApi('mkdir', { path: cwd + name });
+}
+
+// 上传文件到当前目录
+function uploadFile() {
+  const input = document.getElementById('uploader');
+  if (input.files.length === 0) return alert('请选择文件');
+  const form = new FormData();
+  form.append('file', input.files[0]);
+  form.append('path', cwd);
+
+  fetch('/api/upload', { method: 'POST', body: form })
+    .then(() => {
+      input.value = '';
+      refresh();
+    });
+}
+</script>
+</body>
+</html>
+"""
+
+# —— 辅助函数 —— #
+def safe_path(subpath):
+    """
+    将相对路径转换为绝对路径，并校验安全性，防止越界访问。
+    """
+    full = os.path.normpath(os.path.join(ROOT, subpath))
+    # 确保 full 在 ROOT 目录下
+    if os.path.commonpath([ROOT, full]) != ROOT:
+        abort(400, '非法路径')
+    return full
+
+# —— 路由定义 —— #
+
+@app.route('/')
+def index():
+    """渲染前端单页应用"""
+    return render_template_string(TEMPLATE)
+
+@app.route('/api/tree')
+def api_tree():
+    """
+    返回指定目录下的文件和文件夹列表
+    GET 参数：path=相对路径
+    """
+    rel = request.args.get('path', '')
+    base = safe_path(rel)
+    entries = sorted(os.listdir(base))
+    result = []
+    for name in entries:
+        full = os.path.join(base, name)
+        entry = {
+            'name': name,
+            'type': 'folder' if os.path.isdir(full) else 'file'
+        }
+        result.append(entry)
+    return jsonify(result)
+
+@app.route('/api/upload', methods=['POST'])
+def api_upload():
+    """
+    上传文件到指定目录
+    表单字段：file, path
+    """
+    rel = request.form.get('path', '')
+    file = request.files.get('file')
+    if not file:
+        abort(400, '未提供文件')
+    dest = safe_path(os.path.join(rel, file.filename))
+    file.save(dest)
+    return '', 204
+
+@app.route('/api/download')
+def api_download():
+    """
+    下载文件或打包下载文件夹
+    GET 参数：path=相对路径
+    """
+    rel = request.args.get('path', '')
+    target = safe_path(rel)
+
+    if os.path.isdir(target):
+        # 将文件夹打包为 ZIP 并返回
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w') as z:
+            for root, _, files in os.walk(target):
+                for fn in files:
+                    full = os.path.join(root, fn)
+                    # 保持相对路径
+                    relpath = os.path.relpath(full, target)
+                    z.write(full, relpath)
+        buf.seek(0)
+        filename = os.path.basename(rel.rstrip('/')) + '.zip'
+        return send_file(buf, as_attachment=True, download_name=filename)
+
+    # 普通文件下载
+    return send_file(target, as_attachment=True)
+
+# 合并多种操作到一个视图，减少文件级别路由嵌套
+@app.route('/api/<action>', methods=['POST'])
+def api_action(action):
+    """
+    支持 mkdir, rename, delete, copy, move 操作
+    POST JSON 格式根据操作而定
+    """
+    data = request.get_json() or {}
+    if action == 'mkdir':
+        os.makedirs(safe_path(data['path']), exist_ok=True)
+
+    elif action == 'rename':
+        src = safe_path(data['path'])
+        # 目标名拼接到源目录
+        base = os.path.dirname(data['path'])
+        dst = safe_path(os.path.join(base, data['newname']))
+        os.rename(src, dst)
+
+    elif action == 'delete':
+        target = safe_path(data['path'])
+        if os.path.isdir(target):
+            shutil.rmtree(target)
+        else:
+            os.remove(target)
+
+    elif action == 'copy':
+        src = safe_path(data['path'])
+        dst_dir = safe_path(data['dest'])
+        name = os.path.basename(src)
+        dst = os.path.join(dst_dir, name)
+        # 目录 or 文件 复制
+        if os.path.isdir(src):
+            shutil.copytree(src, dst)
+        else:
+            shutil.copy2(src, dst)
+
+    elif action == 'move':
+        src = safe_path(data['src'])
+        dst_dir = safe_path(data['dest'])
+        dst = os.path.join(dst_dir, os.path.basename(src))
+        shutil.move(src, dst)
+
+    else:
+        abort(400, '未知操作')
+
+    return '', 204
+
+# —— 启动应用 —— #
+if __name__ == '__main__':
+    # 开启 debug 模式便于开发调试
+    app.run(debug=True)
