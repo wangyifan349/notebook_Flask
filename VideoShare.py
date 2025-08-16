@@ -382,5 +382,86 @@ def delete_video(video_id):
 def serve_video(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
+
+from flask import jsonify
+# API: List all videos
+@app.route('/api/videos', methods=['GET'])
+def api_list_videos():
+    db = get_db()
+    rows = db.execute(
+        "SELECT vr.id, vr.filename, vr.upload_time, ua.username "
+        "FROM video_record AS vr "
+        "JOIN user_account AS ua ON vr.user_id = ua.id "
+        "ORDER BY vr.upload_time DESC"
+    ).fetchall()
+    videos = []
+    for row in rows:
+        videos.append({
+            "id":            row["id"],
+            "filename":      row["filename"],
+            "upload_time":   row["upload_time"],
+            "username":      row["username"],
+            "stream_url":    url_for('serve_video', filename=row["filename"], _external=True),
+            "download_url":  url_for('serve_video', filename=row["filename"], _external=True)
+        })
+    return jsonify(videos), 200
+
+
+# API: List videos for a given user
+@app.route('/api/user/<username>/videos', methods=['GET'])
+def api_user_videos(username):
+    db = get_db()
+    user = db.execute(
+        "SELECT id FROM user_account WHERE username = ?", (username,)
+    ).fetchone()
+    if not user:
+        return jsonify({"error": "user not found"}), 404
+    rows = db.execute(
+        "SELECT id, filename, upload_time "
+        "FROM video_record "
+        "WHERE user_id = ? "
+        "ORDER BY upload_time DESC",
+        (user["id"],)
+    ).fetchall()
+    videos = []
+    for row in rows:
+        videos.append({
+            "id":            row["id"],
+            "filename":      row["filename"],
+            "upload_time":   row["upload_time"],
+            "stream_url":    url_for('serve_video', filename=row["filename"], _external=True),
+            "download_url":  url_for('serve_video', filename=row["filename"], _external=True)
+        })
+    return jsonify(videos), 200
+
+
+# API: Get single video metadata and URLs
+@app.route('/api/video/<int:video_id>', methods=['GET'])
+def api_video_detail(video_id):
+    db = get_db()
+    row = db.execute(
+        "SELECT vr.id, vr.filename, vr.upload_time, ua.username "
+        "FROM video_record AS vr "
+        "JOIN user_account AS ua ON vr.user_id = ua.id "
+        "WHERE vr.id = ?",
+        (video_id,)
+    ).fetchone()
+    if not row:
+        return jsonify({"error": "video not found"}), 404
+    data = {
+        "id":            row["id"],
+        "filename":      row["filename"],
+        "upload_time":   row["upload_time"],
+        "username":      row["username"],
+        "stream_url":    url_for('serve_video', filename=row["filename"], _external=True),
+        "download_url":  url_for('serve_video', filename=row["filename"], _external=True)
+    }
+    return jsonify(data), 200
+
+
+
+
+
+
 if __name__ == '__main__':
     app.run(debug=True)
