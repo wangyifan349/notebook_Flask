@@ -9,8 +9,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 app = Flask(__name__)
 app.secret_key = 'replace-with-a-secure-random-key'   # 用于 Flask session 加密
 
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))  
-STORAGE_DIR = os.path.join(BASE_DIR, 'uploads')       
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+STORAGE_DIR = os.path.join(BASE_DIR, 'uploads')
 os.makedirs(STORAGE_DIR, exist_ok=True)               # 创建上传目录（如果不存在）
 DATABASE = os.path.join(BASE_DIR, 'app.db')           # SQLite 数据库文件路径
 
@@ -60,14 +60,11 @@ def register():
     password = data.get('password')
     if not username or not password:
         return jsonify(error='用户名和密码不能为空'), 400
-    # 将明文密码哈希后存储
     password_hash = generate_password_hash(password)
     db = get_db()
     try:
-        db.execute(
-            'INSERT INTO users(username, password_hash) VALUES(?, ?)',
-            (username, password_hash)
-        )
+        db.execute('INSERT INTO users(username, password_hash) VALUES(?, ?)',
+                   (username, password_hash))
         db.commit()
     except sqlite3.IntegrityError:
         return jsonify(error='用户名已存在'), 400
@@ -80,11 +77,7 @@ def login():
     username = data.get('username')
     password = data.get('password')
     db = get_db()
-    user = db.execute(
-        'SELECT * FROM users WHERE username = ?',
-        (username,)
-    ).fetchone()
-    # 验证密码正确性
+    user = db.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
     if user and check_password_hash(user['password_hash'], password):
         session['user_id'] = user['id']
         session['username'] = username
@@ -106,6 +99,7 @@ def login_required(f):
     wrapped.__name__ = f.__name__
     return wrapped
 
+# —— 前端 HTML 模板（包含基本文件管理 UI） —— 
 PAGE_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -167,19 +161,19 @@ $(function(){
 
   $('#file-list').on('dblclick', 'li', function(){
     const name = $(this).data('name');
-    const fullPath = (currentFolder ? currentFolder + '/' : '') + name;
+    const full = (currentFolder ? currentFolder + '/' : '') + name;
     if ($(this).hasClass('directory')) {
       currentFolder = currentFolder ? `${currentFolder}/${name}` : name;
       refreshFileList();
     } else if (isMediaFile(name)) {
-      const url = `/stream?path=${encodeURIComponent(fullPath)}`;
+      const url = `/stream?path=${encodeURIComponent(full)}`;
       const tag = /\.(mp3|wav|ogg)$/i.test(name)
         ? `<audio controls src="${url}" style="width:100%;"></audio>`
         : `<video controls src="${url}" style="width:100%;"></video>`;
       $('#playerContent').html(tag);
       $('#playerModal').css('display','flex');
     } else {
-      window.location = `/download?path=${encodeURIComponent(fullPath)}`;
+      window.location = `/download?path=${encodeURIComponent(full)}`;
     }
   });
 
@@ -192,7 +186,7 @@ $(function(){
     if (!currentFolder) return;
     const parts = currentFolder.split('/');
     parts.pop();
-    currentFolder = parts.join('');
+    currentFolder = parts.join('/');
     refreshFileList();
   });
 
@@ -222,58 +216,49 @@ $(function(){
     selector: '#file-list li',
     callback: (action, opts) => {
       const name = opts.$trigger.data('name');
-      const fullPath = (currentFolder ? currentFolder + '/' : '') + name;
+      const full = (currentFolder ? currentFolder + '/' : '') + name;
       if (action === 'delete' && confirm(`Delete "${name}"?`)) {
-        $.ajax({
-          url:'/delete', method:'POST', contentType:'application/json',
-          data: JSON.stringify({ path: fullPath })
-        }).always(refreshFileList);
+        $.ajax({ url:'/delete', method:'POST', contentType:'application/json', data: JSON.stringify({ path: full }) })
+          .always(refreshFileList);
       }
       if (action === 'rename') {
-        const newName = prompt('New name:', name);
-        if (newName && newName !== name) {
-          $.ajax({
-            url:'/rename', method:'POST', contentType:'application/json',
-            data: JSON.stringify({ path: fullPath, new_name: newName })
-          }).always(refreshFileList);
+        const nn = prompt('New name:', name);
+        if (nn && nn !== name) {
+          $.ajax({ url:'/rename', method:'POST', contentType:'application/json', data: JSON.stringify({ path: full, new_name: nn }) })
+            .always(refreshFileList);
         }
       }
       if (action === 'share') {
-        $.ajax({
-          url:'/share', method:'POST', contentType:'application/json',
-          data: JSON.stringify({ path: fullPath, is_directory: opts.$trigger.hasClass('directory') })
-        }).done(res => {
-          prompt('Share link:', res.share_link);
-        });
+        $.ajax({ url:'/share', method:'POST', contentType:'application/json', data: JSON.stringify({ path: full, is_directory: opts.$trigger.hasClass('directory') }) })
+          .done(res => prompt('Share link:', res.share_link));
+      }
+      if (action === 'cancel_share') {
+        const token = prompt('Enter share token to cancel:');
+        if (token) {
+          $.ajax({ url:'/share/cancel', method:'POST', contentType:'application/json', data: JSON.stringify({ token: token }) })
+            .done(res => alert(res.message))
+            .fail(err => alert(err.responseJSON.error));
+        }
       }
     },
     items: {
       delete: { name: "Delete" },
       rename: { name: "Rename" },
-      share: { name: "Share" }
+      share: { name: "Share" },
+      cancel_share: { name: "Cancel Share" }
     }
   });
 
   let dragged = null;
-  $('#file-list').on('dragstart','li', e => {
-    dragged = $(e.target).data('name');
-  });
-  $('#file-list').on('dragover','li.directory', e => {
-    e.preventDefault();
-    $(e.target).addClass('drag-over');
-  });
-  $('#file-list').on('dragleave drop','li.directory', e => {
-    e.preventDefault();
-    $(e.target).removeClass('drag-over');
-  });
+  $('#file-list').on('dragstart','li', e => { dragged = $(e.target).data('name'); });
+  $('#file-list').on('dragover','li.directory', e => { e.preventDefault(); $(e.target).addClass('drag-over'); });
+  $('#file-list').on('dragleave drop','li.directory', e => { e.preventDefault(); $(e.target).removeClass('drag-over'); });
   $('#file-list').on('drop','li.directory', e => {
     const dest = $(e.target).data('name');
     const src = (currentFolder ? currentFolder+'/' : '') + dragged;
     const dst = (currentFolder ? currentFolder+'/' : '') + dest;
-    $.ajax({
-      url:'/move', method:'POST', contentType:'application/json',
-      data: JSON.stringify({ source: src, destination_directory: dst })
-    }).always(refreshFileList);
+    $.ajax({ url:'/move', method:'POST', contentType:'application/json', data: JSON.stringify({ source: src, destination_directory: dst }) })
+      .always(refreshFileList);
   });
 });
 </script>
@@ -281,31 +266,24 @@ $(function(){
 </html>
 """
 
-# —— 渲染主页面 —— 
 @app.route('/')
 @login_required
 def home():
     return render_template_string(PAGE_TEMPLATE)
 
-# —— 列出目录内容 —— 
 @app.route('/list')
 @login_required
 def list_directory():
     rel = request.args.get('path', '')
     abs_path = os.path.join(STORAGE_DIR, rel)
-    # 防止越权访问
     if not abs_path.startswith(STORAGE_DIR) or not os.path.isdir(abs_path):
         abort(403)
     entries = []
     for name in sorted(os.listdir(abs_path)):
         full = os.path.join(abs_path, name)
-        entries.append({
-            'name': name,
-            'isDirectory': os.path.isdir(full)
-        })
+        entries.append({'name': name, 'isDirectory': os.path.isdir(full)})
     return jsonify(entries)
 
-# —— 上传文件 —— 
 @app.route('/upload', methods=['POST'])
 @login_required
 def upload_file():
@@ -316,7 +294,6 @@ def upload_file():
     fileobj.save(os.path.join(folder, fileobj.filename))
     return '', 204
 
-# —— 创建新文件夹 —— 
 @app.route('/mkdir', methods=['POST'])
 @login_required
 def make_directory():
@@ -327,30 +304,20 @@ def make_directory():
     os.makedirs(newdir, exist_ok=True)
     return '', 204
 
-# —— 下载文件 —— 
 @app.route('/download')
 @login_required
 def download_file():
     rel = request.args.get('path', '')
     folder, filename = os.path.split(rel)
-    return send_from_directory(
-        os.path.join(STORAGE_DIR, folder),
-        filename,
-        as_attachment=True
-    )
+    return send_from_directory(os.path.join(STORAGE_DIR, folder), filename, as_attachment=True)
 
-# —— 媒体流式播放 —— 
 @app.route('/stream')
 @login_required
 def stream_file():
     rel = request.args.get('path', '')
     folder, filename = os.path.split(rel)
-    return send_from_directory(
-        os.path.join(STORAGE_DIR, folder),
-        filename
-    )
+    return send_from_directory(os.path.join(STORAGE_DIR, folder), filename)
 
-# —— 删除文件或文件夹 —— 
 @app.route('/delete', methods=['POST'])
 @login_required
 def delete_entry():
@@ -363,7 +330,6 @@ def delete_entry():
         os.remove(abs_path)
     return '', 204
 
-# —— 重命名 —— 
 @app.route('/rename', methods=['POST'])
 @login_required
 def rename_entry():
@@ -376,7 +342,6 @@ def rename_entry():
     os.rename(abs_old, abs_new)
     return '', 204
 
-# —— 移动文件/文件夹 —— 
 @app.route('/move', methods=['POST'])
 @login_required
 def move_entry():
@@ -387,7 +352,6 @@ def move_entry():
     shutil.move(src, os.path.join(dst_dir, os.path.basename(src)))
     return '', 204
 
-# —— 创建分享链接 —— 
 @app.route('/share', methods=['POST'])
 @login_required
 def create_share():
@@ -399,22 +363,28 @@ def create_share():
         return jsonify(error='路径不存在'), 400
     token = str(uuid.uuid4())
     db = get_db()
-    db.execute(
-        'INSERT INTO shares(token, path, is_directory, creator_id) VALUES(?, ?, ?, ?)',
-        (token, rel, int(is_dir), session['user_id'])
-    )
+    db.execute('INSERT INTO shares(token, path, is_directory, creator_id) VALUES(?, ?, ?, ?)',
+               (token, rel, int(is_dir), session['user_id']))
     db.commit()
     link = url_for('access_share', token=token, _external=True)
     return jsonify(share_link=link)
 
-# —— 访问分享 —— 
+@app.route('/share/cancel', methods=['POST'])
+@login_required
+def cancel_share():
+    data = request.get_json()
+    token = data.get('token')
+    db = get_db()
+    cur = db.execute('DELETE FROM shares WHERE token = ? AND creator_id = ?', (token, session['user_id']))
+    db.commit()
+    if cur.rowcount:
+        return jsonify(message='取消分享成功')
+    return jsonify(error='无效的 token 或无权限'), 400
+
 @app.route('/share/<token>')
 def access_share(token):
     db = get_db()
-    rec = db.execute(
-        'SELECT * FROM shares WHERE token = ?',
-        (token,)
-    ).fetchone()
+    rec = db.execute('SELECT * FROM shares WHERE token = ?', (token,)).fetchone()
     if not rec:
         abort(404)
     path = rec['path']
@@ -423,19 +393,12 @@ def access_share(token):
         items = []
         for name in sorted(os.listdir(abs_path)):
             full = os.path.join(abs_path, name)
-            items.append({
-                'name': name,
-                'isDirectory': os.path.isdir(full)
-            })
+            items.append({'name': name, 'isDirectory': os.path.isdir(full)})
         return jsonify(path=path, items=items)
     else:
         folder, filename = os.path.split(path)
-        return send_from_directory(
-            os.path.join(STORAGE_DIR, folder),
-            filename,
-            as_attachment=True
-        )
+        return send_from_directory(os.path.join(STORAGE_DIR, folder), filename, as_attachment=True)
 
 if __name__ == '__main__':
-    init_db()        # 启动前初始化数据库
+    init_db()
     app.run(debug=True)
