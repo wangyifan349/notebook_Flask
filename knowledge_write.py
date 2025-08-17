@@ -11,229 +11,366 @@ from flask_jwt_extended import (
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
 import os
+from marshmallow import Schema, fields, validate, ValidationError
 
+# 创建 Flask 应用
 app = Flask(__name__)
+
+# 配置数据库和 JWT
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'change_this_secret')
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///data.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///app_data.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_TOKEN_LOCATION'] = ['cookies']
-app.config['JWT_COOKIE_SECURE'] = False
+app.config['JWT_COOKIE_SECURE'] = True               # 仅通过 HTTPS 发送 Cookie
 app.config['JWT_ACCESS_COOKIE_PATH'] = '/'
 app.config['JWT_REFRESH_COOKIE_PATH'] = '/'
-app.config['JWT_COOKIE_CSRF_PROTECT'] = False
+app.config['JWT_COOKIE_CSRF_PROTECT'] = True         # 启用 CSRF 防护
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'change_this_jwt_secret')
 
+# 初始化数据库和JWT管理器
 database = SQLAlchemy(app)
 jwt_manager = JWTManager(app)
 
-# ---- Models ----
-class User(database.Model):
+
+# 用户模型
+class UserModel(database.Model):
     id = database.Column(database.Integer, primary_key=True)
-    username = database.Column(database.String(80), unique=True, nullable=False)
-    email = database.Column(database.String(120), unique=True, nullable=False)
+    user_name = database.Column(database.String(80), unique=True, nullable=False)
+    user_email = database.Column(database.String(120), unique=True, nullable=False)
     password_hash = database.Column(database.String(128), nullable=False)
-    created_at = database.Column(database.DateTime, default=datetime.utcnow)
-    notes = database.relationship('Note', backref='author', lazy=True)
+    created_on = database.Column(database.DateTime, default=datetime.utcnow)
+    notes = database.relationship('NoteModel', backref='author', lazy=True)
 
-    def set_password(self, plain_password):
-        self.password_hash = generate_password_hash(plain_password)
+    def set_password(self, password_plain):
+        # 设置并保存密码哈希
+        hashed = generate_password_hash(password_plain)
+        self.password_hash = hashed
 
-    def check_password(self, plain_password):
-        return check_password_hash(self.password_hash, plain_password)
+    def check_password(self, password_plain):
+        # 验证密码正确性
+        return check_password_hash(self.password_hash, password_plain)
 
-class Note(database.Model):
+
+# 笔记模型
+class NoteModel(database.Model):
     id = database.Column(database.Integer, primary_key=True)
-    user_id = database.Column(database.Integer, database.ForeignKey('user.id'), nullable=False)
-    title = database.Column(database.String(200))
-    content = database.Column(database.Text, nullable=False)
-    created_at = database.Column(database.DateTime, default=datetime.utcnow)
-    updated_at = database.Column(database.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    owner_id = database.Column(database.Integer, database.ForeignKey('user_model.id'), nullable=False)
+    note_title = database.Column(database.String(200))
+    note_body = database.Column(database.Text, nullable=False)
+    is_public = database.Column(database.Boolean, default=False)
+    created_on = database.Column(database.DateTime, default=datetime.utcnow)
+    updated_on = database.Column(database.DateTime,
+                                default=datetime.utcnow,
+                                onupdate=datetime.utcnow)
 
-# ---- Database Initialization ----
+
 @app.before_first_request
-def create_tables():
+def create_database_tables():
+    # 启动时创建表
     database.create_all()
 
-# ---- Utility Functions: LCS & similarity ----
-def longest_common_subsequence_length(string_a, string_b):
-    length_a, length_b = len(string_a), len(string_b)
-    dp_table = [[0] * (length_b + 1) for _ in range(length_a + 1)]
-    for index_a in range(1, length_a + 1):
-        for index_b in range(1, length_b + 1):
-            if string_a[index_a - 1] == string_b[index_b - 1]:
-                dp_table[index_a][index_b] = dp_table[index_a - 1][index_b - 1] + 1
+
+def longest_common_subsequence_length(text1, text2):
+    # 计算两个字符串的最长公共子序列长度
+    length1 = len(text1)
+    length2 = len(text2)
+    # 初始化 DP 表
+    dp = []
+    for _ in range(length1 + 1):
+        row = []
+        for __ in range(length2 + 1):
+            row.append(0)
+        dp.append(row)
+
+    # 填表过程
+    for i in range(1, length1 + 1):
+        for j in range(1, length2 + 1):
+            if text1[i - 1] == text2[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1] + 1
             else:
-                dp_table[index_a][index_b] = max(
-                    dp_table[index_a - 1][index_b],
-                    dp_table[index_a][index_b - 1]
-                )
-    return dp_table[length_a][length_b]
+                if dp[i - 1][j] > dp[i][j - 1]:
+                    dp[i][j] = dp[i - 1][j]
+                else:
+                    dp[i][j] = dp[i][j - 1]
+    return dp[length1][length2]
 
-def similarity_score(text_a, text_b):
-    if not text_a or not text_b:
+
+def compute_similarity_score(text1, text2):
+    # 基于 LCS 算法计算相似度
+    if not text1 or not text2:
         return 0
-    common_length = longest_common_subsequence_length(text_a.lower(), text_b.lower())
-    return common_length * 2 / (len(text_a) + len(text_b))
+    common_length = longest_common_subsequence_length(
+        text1.lower(), text2.lower()
+    )
+    total_length = len(text1) + len(text2)
+    score = common_length * 2 / total_length
+    return score
 
-# ---- Authentication Endpoints ----
+
+# 注册请求验证模式
+class RegistrationSchema(Schema):
+    user_name = fields.Str(
+        required=True,
+        validate=validate.Length(min=3, max=80)
+    )
+    user_email = fields.Email(
+        required=True,
+        validate=validate.Length(max=120)
+    )
+    user_password = fields.Str(
+        required=True,
+        validate=validate.Length(min=6)
+    )
+
+
+registration_schema = RegistrationSchema()
+
+
 @app.route('/api/register', methods=['POST'])
-def register_user():
-    data = request.json or {}
-    if not data.get('username') or not data.get('email') or not data.get('password'):
-        return jsonify(message='Missing required fields'), 400
-    existing_user = User.query.filter(
-        (User.username == data['username']) | (User.email == data['email'])
-    ).first()
-    if existing_user:
-        return jsonify(message='Username or email already exists'), 400
-    new_user = User(username=data['username'], email=data['email'])
-    new_user.set_password(data['password'])
-    database.session.add(new_user)
+def api_register_user():
+    # 用户注册接口
+    request_data = request.json or {}
+    try:
+        validated = registration_schema.load(request_data)
+    except ValidationError as error:
+        return jsonify(error.messages), 400
+
+    existing_username = UserModel.query.filter_by(user_name=validated['user_name']).first()
+    existing_email = UserModel.query.filter_by(user_email=validated['user_email']).first()
+    if existing_username or existing_email:
+        return jsonify(message='Username or email already registered'), 400
+
+    # 创建新用户
+    user = UserModel()
+    user.user_name = validated['user_name']
+    user.user_email = validated['user_email']
+    user.set_password(validated['user_password'])
+
+    database.session.add(user)
     database.session.commit()
     return jsonify(message='Registration successful'), 201
 
+
 @app.route('/api/login', methods=['POST'])
-def login_user():
-    data = request.json or {}
-    if not data.get('username') or not data.get('password'):
-        return jsonify(message='Missing required fields'), 400
-    user = User.query.filter_by(username=data['username']).first()
-    if not user or not user.check_password(data['password']):
+def api_login_user():
+    # 用户登录接口
+    request_data = request.json or {}
+    if 'user_name' not in request_data or 'user_password' not in request_data:
+        return jsonify(message='Username and password required'), 400
+
+    user = UserModel.query.filter_by(user_name=request_data['user_name']).first()
+    if not user or not user.check_password(request_data['user_password']):
         return jsonify(message='Invalid username or password'), 401
-    access_token = create_access_token(identity=user.id, expires_delta=timedelta(hours=1))
+
+    # 生成并设置 JWT Cookie
+    token = create_access_token(identity=user.id, expires_delta=timedelta(hours=1))
     response = jsonify(message='Login successful')
-    set_access_cookies(response, access_token)
+    set_access_cookies(response, token)
     return response, 200
 
+
 @app.route('/api/logout', methods=['POST'])
-def logout_user():
+def api_logout_user():
+    # 用户登出接口
     response = jsonify(message='Logout successful')
     unset_jwt_cookies(response)
     return response, 200
 
-# ---- Note Management Endpoints ----
+
 @app.route('/api/note', methods=['POST'])
 @jwt_required()
-def create_note():
-    data = request.json or {}
-    if not data.get('content'):
-        return jsonify(message='Content is required'), 400
-    current_user_id = get_jwt_identity()
-    new_note = Note(
-        user_id=current_user_id,
-        title=data.get('title', ''),
-        content=data['content']
-    )
-    database.session.add(new_note)
+def api_create_note():
+    # 创建笔记接口
+    request_data = request.json or {}
+    if 'note_body' not in request_data:
+        return jsonify(message='Note body is required'), 400
+
+    user_id = get_jwt_identity()
+    note = NoteModel()
+    note.owner_id = user_id
+    note.note_title = request_data.get('note_title', '')
+    note.note_body = request_data['note_body']
+    note.is_public = request_data.get('is_public', False)
+
+    database.session.add(note)
     database.session.commit()
-    return jsonify(message='Note created', note_id=new_note.id), 201
+    return jsonify(message='Note created', note_id=note.id), 201
+
 
 @app.route('/api/note/<int:note_id>', methods=['PUT'])
 @jwt_required()
-def update_note(note_id):
-    existing_note = Note.query.get_or_404(note_id)
-    current_user_id = get_jwt_identity()
-    if existing_note.user_id != current_user_id:
+def api_update_note(note_id):
+    # 更新笔记接口
+    note = NoteModel.query.get_or_404(note_id)
+    current_user = get_jwt_identity()
+    if note.owner_id != current_user:
         return jsonify(message='Forbidden'), 403
-    data = request.json or {}
-    if 'title' in data:
-        existing_note.title = data['title']
-    if 'content' in data:
-        existing_note.content = data['content']
+
+    request_data = request.json or {}
+    if 'note_title' in request_data:
+        note.note_title = request_data['note_title']
+    if 'note_body' in request_data:
+        note.note_body = request_data['note_body']
+    if 'is_public' in request_data:
+        note.is_public = request_data['is_public']
+
     database.session.commit()
     return jsonify(message='Note updated'), 200
 
+
 @app.route('/api/note/<int:note_id>', methods=['DELETE'])
 @jwt_required()
-def delete_note(note_id):
-    existing_note = Note.query.get_or_404(note_id)
-    current_user_id = get_jwt_identity()
-    if existing_note.user_id != current_user_id:
+def api_delete_note(note_id):
+    # 删除笔记接口
+    note = NoteModel.query.get_or_404(note_id)
+    current_user = get_jwt_identity()
+    if note.owner_id != current_user:
         return jsonify(message='Forbidden'), 403
-    database.session.delete(existing_note)
+
+    database.session.delete(note)
     database.session.commit()
     return jsonify(message='Note deleted'), 200
 
+
 @app.route('/api/dashboard', methods=['GET'])
 @jwt_required()
-def get_user_dashboard():
-    current_user_id = get_jwt_identity()
-    user_notes = Note.query.filter_by(user_id=current_user_id).order_by(Note.created_at.desc()).all()
-    note_list = []
-    for note in user_notes:
-        note_list.append({
-            'noteId': note.id,
-            'noteTitle': note.title,
-            'createdAt': note.created_at.isoformat(),
-            'updatedAt': note.updated_at.isoformat()
-        })
-    return jsonify(notes=note_list), 200
+def api_get_dashboard():
+    # 获取用户笔记列表
+    current_user = get_jwt_identity()
+    user_notes = NoteModel.query.filter_by(owner_id=current_user).order_by(
+        NoteModel.created_on.desc()
+    ).all()
+    result_list = []
+    for single_note in user_notes:
+        entry = {
+            'note_id': single_note.id,
+            'note_title': single_note.note_title,
+            'created_on': single_note.created_on.isoformat(),
+            'updated_on': single_note.updated_on.isoformat()
+        }
+        result_list.append(entry)
+    return jsonify(notes=result_list), 200
+
 
 @app.route('/api/note/<int:note_id>/view', methods=['GET'])
-@jwt_required(optional=True)
-def view_note_detail(note_id):
-    note = Note.query.get_or_404(note_id)
-    return jsonify({
-        'noteId': note.id,
-        'noteTitle': note.title,
-        'noteContent': note.content,
-        'noteAuthor': note.author.username,
-        'createdAt': note.created_at.isoformat(),
-        'updatedAt': note.updated_at.isoformat()
-    }), 200
+@jwt_required()
+def api_view_note_detail(note_id):
+    # 查看单条笔记详情
+    note = NoteModel.query.get_or_404(note_id)
+    current_user = get_jwt_identity()
+    if not note.is_public and note.owner_id != current_user:
+        return jsonify(message='Forbidden'), 403
 
-# ---- Search Endpoints ----
+    data = {
+        'note_id': note.id,
+        'note_title': note.note_title,
+        'note_body': note.note_body,
+        'author_name': note.author.user_name,
+        'is_public': note.is_public,
+        'created_on': note.created_on.isoformat(),
+        'updated_on': note.updated_on.isoformat()
+    }
+    return jsonify(data), 200
+
+
 @app.route('/api/search/user', methods=['GET'])
-def search_users():
+def api_search_users():
+    # 按用户名搜索接口，带分页和相似度计算
     query_text = request.args.get('q', '').strip()
     if not query_text:
-        return jsonify(message='Please provide a search query'), 400
-    matched_list = []
-    for user in User.query.all():
-        score = similarity_score(user.username, query_text)
-        if score > 0:
-            matched_list.append((user, score))
-    matched_list.sort(key=lambda pair: pair[1], reverse=True)
-    results = []
-    for user, score in matched_list:
-        results.append({
-            'username': user.username,
-            'similarityScore': round(score, 3)
-        })
-    return jsonify(results=results), 200
+        return jsonify(message='Search query required'), 400
+
+    page_str = request.args.get('page', '1')
+    per_page_str = request.args.get('per_page', '20')
+    page = int(page_str)
+    per_page = int(per_page_str)
+    if per_page > 50:
+        per_page = 50
+
+    pagination = UserModel.query.order_by(UserModel.user_name).paginate(
+        page=page, per_page=per_page, error_out=False
+    )
+    matched_items = []
+    for user_item in pagination.items:
+        score = compute_similarity_score(user_item.user_name, query_text)
+        if score >= 0.1:
+            matched_items.append((user_item, score))
+    matched_items.sort(key=lambda pair: pair[1], reverse=True)
+
+    result_list = []
+    for pair in matched_items:
+        user_item = pair[0]
+        similarity_value = pair[1]
+        entry = {
+            'user_name': user_item.user_name,
+            'similarity_score': round(similarity_value, 3)
+        }
+        result_list.append(entry)
+
+    response_data = {
+        'results': result_list,
+        'page': page,
+        'per_page': per_page,
+        'total': pagination.total
+    }
+    return jsonify(response_data), 200
+
 
 @app.route('/api/search/note', methods=['GET'])
-def search_notes():
+def api_search_notes():
+    # 按笔记标题搜索接口，带分页和相似度计算
     query_text = request.args.get('q', '').strip()
     if not query_text:
-        return jsonify(message='Please provide a search query'), 400
-    matched_list = []
-    for note in Note.query.all():
-        if not note.title:
-            continue
-        score = similarity_score(note.title, query_text)
-        if score > 0:
-            matched_list.append((note, score))
-    # sort by similarity score then by creation date, both descending
-    matched_list.sort(key=lambda pair: (pair[1], pair[0].created_at), reverse=True)
-    results = []
-    for note, score in matched_list:
-        results.append({
-            'noteId': note.id,
-            'noteTitle': note.title,
-            'noteAuthor': note.author.username,
-            'similarityScore': round(score, 3),
-            'createdAt': note.created_at.isoformat()
-        })
-    return jsonify(results=results), 200
+        return jsonify(message='Search query required'), 400
 
-# ---- Frontend Template ----
-FRONTEND_HTML = """
+    page_str = request.args.get('page', '1')
+    per_page_str = request.args.get('per_page', '20')
+    page = int(page_str)
+    per_page = int(per_page_str)
+    if per_page > 50:
+        per_page = 50
+
+    pagination = NoteModel.query.filter(
+        NoteModel.note_title.isnot(None)
+    ).order_by(
+        NoteModel.created_on.desc()
+    ).paginate(page=page, per_page=per_page, error_out=False)
+
+    matched_items = []
+    for note_item in pagination.items:
+        score = compute_similarity_score(note_item.note_title, query_text)
+        if score >= 0.1:
+            matched_items.append((note_item, score))
+    matched_items.sort(key=lambda pair: (pair[1], pair[0].created_on), reverse=True)
+
+    result_list = []
+    for pair in matched_items:
+        note_item = pair[0]
+        similarity_value = pair[1]
+        entry = {
+            'note_id': note_item.id,
+            'note_title': note_item.note_title,
+            'author_name': note_item.author.user_name,
+            'similarity_score': round(similarity_value, 3),
+            'created_on': note_item.created_on.isoformat()
+        }
+        result_list.append(entry)
+
+    response_data = {
+        'results': result_list,
+        'page': page,
+        'per_page': per_page,
+        'total': pagination.total
+    }
+    return jsonify(response_data), 200
+
+
+frontend_html = """
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Plain Text Knowledge Publishing</title>
+  <title>Knowledge Sharing</title>
   <style>
     body { font-family: Arial, sans-serif; margin: 20px; }
     input, button, textarea { margin: 5px 0; padding: 5px; width: 100%; }
@@ -243,156 +380,208 @@ FRONTEND_HTML = """
 <body>
 
 <h2>Register / Login</h2>
-<div id="authentication">
-  <input id="registerUsername" placeholder="Username"><br>
-  <input id="registerEmail" placeholder="Email"><br>
-  <input id="registerPassword" type="password" placeholder="Password"><br>
-  <button onclick="registerUser()">Register</button>
+<div id="authSection">
+  <input id="inputRegisterUserName" placeholder="Username"><br>
+  <input id="inputRegisterEmail" placeholder="Email"><br>
+  <input id="inputRegisterPassword" type="password" placeholder="Password"><br>
+  <button onclick="doRegister()">Register</button>
   <hr>
-  <input id="loginUsername" placeholder="Username"><br>
-  <input id="loginPassword" type="password" placeholder="Password"><br>
-  <button onclick="loginUser()">Login</button>
-  <button onclick="logoutUser()">Logout</button>
+  <input id="inputLoginUserName" placeholder="Username"><br>
+  <input id="inputLoginPassword" type="password" placeholder="Password"><br>
+  <button onclick="doLogin()">Login</button>
+  <button onclick="doLogout()">Logout</button>
 </div>
 
 <h2>Create / Edit Note</h2>
-<div id="noteEditor">
-  <input id="editorNoteId" type="hidden">
-  <input id="editorNoteTitle" placeholder="Title (optional)"><br>
-  <textarea id="editorNoteContent" rows="4" placeholder="Content"></textarea><br>
-  <button onclick="saveOrUpdateNote()">Save Note</button>
+<div id="noteEditorSection">
+  <input id="inputNoteId" type="hidden">
+  <input id="inputNoteTitle" placeholder="Title"><br>
+  <textarea id="inputNoteBody" rows="4" placeholder="Content"></textarea><br>
+  <label><input type="checkbox" id="inputNotePublic"> Public</label><br>
+  <button onclick="saveNote()">Save Note</button>
 </div>
 
-<h2>My Dashboard</h2>
-<div id="dashboardContainer"></div>
+<h2>My Notes</h2>
+<div id="notesContainer"></div>
 
-<h2>Search Users / Notes by Title</h2>
-<input id="searchQuery" placeholder="Search term"><br>
-<button onclick="searchUsers()">Search Users</button>
-<button onclick="searchNotes()">Search Notes</button>
-<div id="searchResults"></div>
+<h2>Search Users / Notes</h2>
+<input id="inputSearchText" placeholder="Search term"><br>
+<button onclick="searchForUsers()">Search Users</button>
+<button onclick="searchForNotes()">Search Notes</button>
+<div id="searchResultsContainer"></div>
 
 <script>
-function apiRequest(path, method = 'GET', data = null) {
-  const options = { method: method, headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin' };
+function getCookie(name) {
+  var match = document.cookie.match('(^|;) ?' + name + '=([^;]*)(;|$)');
+  return match ? match[2] : null;
+}
+
+function apiCall(url, method, data) {
+  var headers = {'Content-Type': 'application/json'};
+  var csrf = getCookie('csrf_access_token');
+  if (csrf) {
+    headers['X-CSRF-TOKEN'] = csrf;
+  }
+  var options = {
+    method: method,
+    headers: headers,
+    credentials: 'same-origin'
+  };
   if (data) {
     options.body = JSON.stringify(data);
   }
-  return fetch(path, options).then(response => response.json());
-}
-
-function registerUser() {
-  const username = document.getElementById('registerUsername').value;
-  const email = document.getElementById('registerEmail').value;
-  const password = document.getElementById('registerPassword').value;
-  apiRequest('/api/register', 'POST', { username: username, email: email, password: password })
-    .then(response => alert(response.message));
-}
-
-function loginUser() {
-  const username = document.getElementById('loginUsername').value;
-  const password = document.getElementById('loginPassword').value;
-  apiRequest('/api/login', 'POST', { username: username, password: password })
-    .then(response => { alert(response.message); loadDashboard(); });
-}
-
-function logoutUser() {
-  apiRequest('/api/logout', 'POST')
-    .then(response => { alert(response.message); document.getElementById('dashboardContainer').innerHTML = ''; });
-}
-
-function loadDashboard() {
-  apiRequest('/api/dashboard').then(response => {
-    let html = '';
-    response.notes.forEach(note => {
-      html += `<div class="note">
-        <a href="#" onclick="viewNoteDetail(${note.noteId})"><b>${note.noteTitle || '(No Title)'}</b></a><br>
-        <i>${note.createdAt}</i><br>
-        <button onclick="populateEditor(${note.noteId}, '${note.noteTitle}', '')">Edit</button>
-        <button onclick="deleteNote(${note.noteId})">Delete</button>
-      </div>`;
-    });
-    document.getElementById('dashboardContainer').innerHTML = html;
+  return fetch(url, options).then(function(response) {
+    return response.json();
   });
 }
 
-function saveOrUpdateNote() {
-  const noteId = document.getElementById('editorNoteId').value;
-  const title = document.getElementById('editorNoteTitle').value;
-  const content = document.getElementById('editorNoteContent').value;
-  const path = noteId ? `/api/note/${noteId}` : '/api/note';
-  const method = noteId ? 'PUT' : 'POST';
-  apiRequest(path, method, { title: title, content: content })
-    .then(response => {
-      alert(response.message);
-      clearEditor();
-      loadDashboard();
-    });
-}
-
-function populateEditor(id, title, content) {
-  document.getElementById('editorNoteId').value = id;
-  document.getElementById('editorNoteTitle').value = title;
-  document.getElementById('editorNoteContent').value = content;
-}
-
-function deleteNote(id) {
-  if (!confirm('Confirm deletion?')) { return; }
-  apiRequest(`/api/note/${id}`, 'DELETE')
-    .then(response => { alert(response.message); loadDashboard(); });
-}
-
-function searchUsers() {
-  const queryText = document.getElementById('searchQuery').value;
-  apiRequest(`/api/search/user?q=${encodeURIComponent(queryText)}`)
-    .then(response => {
-      let html = '<h4>User Search Results</h4>';
-      response.results.forEach(user => {
-        html += `<div>${user.username} (Similarity: ${user.similarityScore})</div>`;
-      });
-      document.getElementById('searchResults').innerHTML = html;
-    });
-}
-
-function searchNotes() {
-  const queryText = document.getElementById('searchQuery').value;
-  apiRequest(`/api/search/note?q=${encodeURIComponent(queryText)}`)
-    .then(response => {
-      let html = '<h4>Note Search Results</h4>';
-      response.results.forEach(note => {
-        html += `<div>
-          <a href="#" onclick="viewNoteDetail(${note.noteId})">${note.noteTitle}</a>
-          by ${note.noteAuthor} (Similarity: ${note.similarityScore})
-        </div>`;
-      });
-      document.getElementById('searchResults').innerHTML = html;
-    });
-}
-
-function viewNoteDetail(noteId) {
-  apiRequest(`/api/note/${noteId}/view`).then(note => {
-    const contentHtml = note.noteContent.replace(/\\n/g, '<br>');
-    const detailHtml = `
-      <h3>${note.noteTitle || '(No Title)'}</h3>
-      <p>Author: ${note.noteAuthor}</p>
-      <p>${contentHtml}</p>
-      <p><i>Created: ${note.createdAt}</i></p>
-    `;
-    const popup = window.open('', '_blank', 'width=600,height=400');
-    popup.document.write(detailHtml);
+function doRegister() {
+  var name = document.getElementById('inputRegisterUserName').value;
+  var email = document.getElementById('inputRegisterEmail').value;
+  var pwd  = document.getElementById('inputRegisterPassword').value;
+  apiCall('/api/register', 'POST', {
+    user_name: name,
+    user_email: email,
+    user_password: pwd
+  }).then(function(res) {
+    alert(res.message || JSON.stringify(res));
   });
 }
 
-window.onload = loadDashboard;
+function doLogin() {
+  var name = document.getElementById('inputLoginUserName').value;
+  var pwd  = document.getElementById('inputLoginPassword').value;
+  apiCall('/api/login', 'POST', {
+    user_name: name,
+    user_password: pwd
+  }).then(function(res) {
+    alert(res.message);
+    loadMyNotes();
+  });
+}
+
+function doLogout() {
+  apiCall('/api/logout', 'POST').then(function(res) {
+    alert(res.message);
+    document.getElementById('notesContainer').innerHTML = '';
+  });
+}
+
+function loadMyNotes() {
+  apiCall('/api/dashboard', 'GET').then(function(res) {
+    var container = document.getElementById('notesContainer');
+    container.innerHTML = '';
+    var notesList = res.notes;
+    for (var i = 0; i < notesList.length; i++) {
+      var note = notesList[i];
+      var div = document.createElement('div');
+      div.className = 'note';
+      var title = note.note_title || '(No Title)';
+      div.innerHTML = '<b>' + title + '</b><br>' +
+                      '<i>' + note.created_on + '</i><br>' +
+                      '<button onclick="editExistingNote(' + note.note_id + ')">Edit</button>' +
+                      '<button onclick="deleteExistingNote(' + note.note_id + ')">Delete</button>';
+      container.appendChild(div);
+    }
+  });
+}
+
+function editExistingNote(id) {
+  apiCall('/api/note/' + id + '/view', 'GET').then(function(note) {
+    document.getElementById('inputNoteId').value = note.note_id;
+    document.getElementById('inputNoteTitle').value = note.note_title;
+    document.getElementById('inputNoteBody').value = note.note_body;
+    document.getElementById('inputNotePublic').checked = note.is_public;
+  });
+}
+
+function saveNote() {
+  var id    = document.getElementById('inputNoteId').value;
+  var title = document.getElementById('inputNoteTitle').value;
+  var body  = document.getElementById('inputNoteBody').value;
+  var pub   = document.getElementById('inputNotePublic').checked;
+  var url    = '/api/note';
+  var method = 'POST';
+  if (id) {
+    url    = '/api/note/' + id;
+    method = 'PUT';
+  }
+  apiCall(url, method, {
+    note_title: title,
+    note_body: body,
+    is_public:  pub
+  }).then(function(res) {
+    alert(res.message);
+    clearEditorFields();
+    loadMyNotes();
+  });
+}
+
+function clearEditorFields() {
+  document.getElementById('inputNoteId').value = '';
+  document.getElementById('inputNoteTitle').value = '';
+  document.getElementById('inputNoteBody').value = '';
+  document.getElementById('inputNotePublic').checked = false;
+}
+
+function deleteExistingNote(id) {
+  if (!confirm('Confirm deletion?')) {
+    return;
+  }
+  apiCall('/api/note/' + id, 'DELETE').then(function(res) {
+    alert(res.message);
+    loadMyNotes();
+  });
+}
+
+function searchForUsers() {
+  var text = encodeURIComponent(
+    document.getElementById('inputSearchText').value
+  );
+  apiCall('/api/search/user?q=' + text, 'GET').then(function(res) {
+    var out = '<h4>Users</h4>';
+    var list = res.results;
+    for (var i = 0; i < list.length; i++) {
+      var u = list[i];
+      out += '<div>' + u.user_name +
+             ' (Similarity: ' + u.similarity_score + ')</div>';
+    }
+    document.getElementById('searchResultsContainer').innerHTML = out;
+  });
+}
+
+function searchForNotes() {
+  var text = encodeURIComponent(
+    document.getElementById('inputSearchText').value
+  );
+  apiCall('/api/search/note?q=' + text, 'GET').then(function(res) {
+    var out = '<h4>Notes</h4>';
+    var list = res.results;
+    for (var i = 0; i < list.length; i++) {
+      var n = list[i];
+      out += '<div>' +
+             n.note_title + ' by ' + n.author_name +
+             ' (Similarity: ' + n.similarity_score + ')</div>';
+    }
+    document.getElementById('searchResultsContainer').innerHTML = out;
+  });
+}
+
+window.onload = loadMyNotes  # 页面加载后自动拉取用户笔记列表
+
 </script>
 
 </body>
 </html>
 """
 
+
 @app.route('/')
 def index_page():
-    return render_template_string(FRONTEND_HTML)
+    # 渲染前端页面
+    return render_template_string(frontend_html)
+
 
 if __name__ == '__main__':
+    # 启动 Flask 开发服务器
     app.run(debug=True)
